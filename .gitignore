@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.iso
+
+# Debug artifacts
+*.log
+*.dump
+
+# Editor
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*~
+*.zip
