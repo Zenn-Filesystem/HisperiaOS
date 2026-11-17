@@ -21,6 +21,7 @@ static uint64_t free_frames;
 static uint64_t pmm_cursor = PMM_FIRST_FRAME;
 static uint64_t hhdm_base;
 static uint64_t ignored_bytes;
+static int pmm_ready;
 
 /* =========================================
  * BITMAP HELPERS
@@ -138,6 +139,8 @@ static void reserve_range(uint64_t base, uint64_t len)
 int pmm_init(const struct limine_memmap_response *memmap,
              uint64_t hhdm_offset)
 {
+    pmm_ready = 0;
+
     for (uint64_t i = 0; i < PMM_BITMAP_BYTES; i++) {
         bitmap[i] = 0xFF;
         allocated_bitmap[i] = 0;
@@ -169,6 +172,7 @@ int pmm_init(const struct limine_memmap_response *memmap,
     /* 1 MiB pertama (legacy/BIOS/DMA) tetap dilarang, seperti Heinx. */
     reserve_range(0, 0x100000);
 
+    pmm_ready = 1;
     return 1;
 }
 
@@ -252,6 +256,12 @@ int pmm_self_test(void)
     volatile uint64_t *page_b =
         (volatile uint64_t *)pmm_phys_to_virt(frame_b);
 
+    if (!page_a || !page_b) {
+        (void)pmm_free(frame_a);
+        (void)pmm_free(frame_b);
+        return 0;
+    }
+
     *page_a = pattern_a;
     *page_b = pattern_b;
 
@@ -293,5 +303,11 @@ uint64_t pmm_ignored_bytes(void)
 
 void *pmm_phys_to_virt(uint64_t phys)
 {
-    return (void *)(uintptr_t)(phys + hhdm_base);
+    if (!pmm_ready || phys >= PMM_MAX_PHYS)
+        return 0;
+
+    if (phys > (uint64_t)UINTPTR_MAX - hhdm_base)
+        return 0;
+
+    return (void *)(uintptr_t)(hhdm_base + phys);
 }

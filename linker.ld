@@ -24,29 +24,36 @@ SECTIONS {
 
     /* Limine protocol requests */
     .limine_requests : {
+        __kernel_requests_start = .;
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
+        __kernel_requests_end = .;
     } :limine_requests
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     /* Executable code */
     .text : {
+        __kernel_text_start = .;
         *(.text .text.*)
+        __kernel_text_end = .;
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     /* Read-only data */
     .rodata : {
+        __kernel_rodata_start = .;
         *(.rodata .rodata.*)
+        __kernel_rodata_end = .;
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     /* Initialized data */
     .data : {
+        __kernel_data_start = .;
         *(.data .data.*)
     } :data
 
@@ -54,6 +61,7 @@ SECTIONS {
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
+        __kernel_bss_end = .;
     } :data
 
     /* Discard unnecessary sections */

@@ -33,6 +33,9 @@ static struct tss tss = {
 static uint8_t df_ist_stack[DF_IST_STACK_SIZE]
     __attribute__((aligned(16)));
 
+static uintptr_t ist1_stack_bottom;
+static uintptr_t ist1_stack_top;
+
 /* =========================================
  * GDTR
  * ========================================= */
@@ -150,14 +153,24 @@ void gdt_ist_init(void)
         (uintptr_t)(df_ist_stack + sizeof(df_ist_stack));
 
     tss.ist1 = (uint64_t)stack_top;
+    ist1_stack_bottom = (uintptr_t)df_ist_stack;
+    ist1_stack_top = stack_top;
+}
+
+int gdt_ist_set_stack(uintptr_t stack_bottom, uintptr_t stack_top)
+{
+    if (!stack_bottom || stack_top <= stack_bottom || (stack_top & 0xFULL))
+        return 0;
+
+    tss.ist1 = (uint64_t)stack_top;
+    ist1_stack_bottom = stack_bottom;
+    ist1_stack_top = stack_top;
+    return 1;
 }
 
 int gdt_ist1_contains(uintptr_t address)
 {
-    uintptr_t bottom = (uintptr_t)df_ist_stack;
-    uintptr_t top = bottom + sizeof(df_ist_stack);
-
-    return address >= bottom && address < top;
+    return address >= ist1_stack_bottom && address < ist1_stack_top;
 }
 
 /* =========================================
@@ -166,16 +179,13 @@ int gdt_ist1_contains(uintptr_t address)
 
 int gdt_ist1_verify(uint64_t *stack_top_out)
 {
-    uint64_t expected =
-        (uint64_t)(uintptr_t)(
-            df_ist_stack + sizeof(df_ist_stack)
-        );
+    uint64_t expected = (uint64_t)ist1_stack_top;
 
     uint64_t actual = tss.ist1;
 
     if (stack_top_out)
         *stack_top_out = actual;
 
-    return actual == expected &&
-           (actual & 0xF) == 0;
+    return ist1_stack_bottom < ist1_stack_top &&
+           actual == expected && (actual & 0xF) == 0;
 }

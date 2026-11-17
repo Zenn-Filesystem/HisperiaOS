@@ -6,6 +6,35 @@
 #include "interrupt.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "stack.h"
+#include "heap.h"
+
+#ifndef HISPERIA_RUN_EXCEPTION_TEST
+#define HISPERIA_RUN_EXCEPTION_TEST 0
+#endif
+#ifndef HISPERIA_RUN_MPROTECT_TEST
+#define HISPERIA_RUN_MPROTECT_TEST 0
+#endif
+
+/* Linker-defined page-aligned kernel section boundaries. */
+extern char __kernel_requests_start[];
+extern char __kernel_requests_end[];
+extern char __kernel_text_start[];
+extern char __kernel_text_end[];
+extern char __kernel_rodata_start[];
+extern char __kernel_rodata_end[];
+extern char __kernel_data_start[];
+extern char __kernel_bss_end[];
+
+/* Dedicated probes used to verify section permissions. */
+__attribute__((used, aligned(4096)))
+const volatile uint64_t vmm_rodata_probe = 0x524F444154415052ULL;
+
+__attribute__((used, aligned(4096)))
+volatile uint64_t vmm_data_probe = 0x4441544150524F42ULL;
+
+__attribute__((used, aligned(4096)))
+static volatile uint64_t vmm_bss_probe;
 
 /* =========================================
  * LIMINE COMPATIBILITY
@@ -538,6 +567,13 @@ void isr_report(
         );
     }
 
+    if (frame->vector == 14) {
+        uint64_t fault_address;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+        console_print("\n[PF  ] Fault address : ");
+        console_print_hex(fault_address);
+    }
+
     console_print("\n[EXCP] Vector     : ");
     console_print_u64(frame->vector);
 
@@ -590,13 +626,25 @@ static void halt_cpu(void) {
     }
 }
 
+void isr_test_report(int passed)
+{
+    if (passed) {
+#if HISPERIA_RUN_MPROTECT_TEST == 1
+        console_print("[TEST] Fault enforcement PASS: .rodata write trapped by #PF.\n");
+#elif HISPERIA_RUN_MPROTECT_TEST == 2
+        console_print("[TEST] Fault enforcement PASS: NX execution trapped by #PF.\n");
+#else
+        console_print("[TEST] Expected protection fault observed.\n");
+#endif
+    } else {
+        console_print("[TEST] Fault enforcement FAILED: unexpected #PF details.\n");
+    }
+}
+
+
 /* =========================================
  * EXCEPTION TESTS
  * ========================================= */
-
-#ifndef HISPERIA_RUN_EXCEPTION_TEST
-#define HISPERIA_RUN_EXCEPTION_TEST 0
-#endif
 
 #if HISPERIA_RUN_EXCEPTION_TEST
 #define EXCEPTION_TEST 2   /* 0 = int3, 1 = ud2, 2 = #GP */
@@ -617,6 +665,161 @@ static void run_exception_test(int which)
     }
 }
 #endif /* HISPERIA_RUN_EXCEPTION_TEST */
+
+/* =========================================
+ * KERNEL MEMORY PROTECTION SELF-CHECK
+ * ========================================= */
+
+static int verify_protected_range(uint64_t start,
+                                  uint64_t end,
+                                  int kernel_writable,
+                                  int kernel_executable,
+                                  int hhdm_writable)
+{
+    if (start > end || end > UINT64_MAX - (VMM_PAGE_SIZE - 1ULL))
+        return 0;
+    if (start == end)
+        return 1;
+
+    uint64_t page = start & ~(VMM_PAGE_SIZE - 1ULL);
+    uint64_t limit = (end + VMM_PAGE_SIZE - 1ULL) &
+                     ~(VMM_PAGE_SIZE - 1ULL);
+
+    for (; page < limit; page += VMM_PAGE_SIZE) {
+        struct vmm_mapping_info kernel_info;
+        struct vmm_mapping_info alias_info;
+
+        if (!vmm_query_mapping(page, &kernel_info))
+            return 0;
+
+        if (kernel_info.writable != (uint8_t)kernel_writable ||
+            kernel_info.executable != (uint8_t)kernel_executable ||
+            kernel_info.user)
+            return 0;
+
+        uint64_t physical_page = kernel_info.physical_address &
+                                 ~(VMM_PAGE_SIZE - 1ULL);
+        uintptr_t alias = (uintptr_t)pmm_phys_to_virt(physical_page);
+        if (!alias ||
+            !vmm_query_mapping((uint64_t)alias, &alias_info))
+            return 0;
+
+        if (alias_info.writable != (uint8_t)hhdm_writable ||
+            alias_info.executable || alias_info.user)
+            return 0;
+    }
+
+    return 1;
+}
+
+static int verify_kernel_section_permissions(void)
+{
+    return
+        verify_protected_range(
+            (uint64_t)(uintptr_t)__kernel_requests_start,
+            (uint64_t)(uintptr_t)__kernel_requests_end,
+            0, 0, 0) &&
+        verify_protected_range(
+            (uint64_t)(uintptr_t)__kernel_text_start,
+            (uint64_t)(uintptr_t)__kernel_text_end,
+            0, 1, 0) &&
+        verify_protected_range(
+            (uint64_t)(uintptr_t)__kernel_rodata_start,
+            (uint64_t)(uintptr_t)__kernel_rodata_end,
+            0, 0, 0) &&
+        verify_protected_range(
+            (uint64_t)(uintptr_t)__kernel_data_start,
+            (uint64_t)(uintptr_t)__kernel_bss_end,
+            1, 0, 1);
+}
+
+
+/* ========================================================================== 
+ * ADDRESS-SPACE SELF-TEST
+ *
+ * Creates two independent lower-half user spaces, maps the same VA to
+ * different physical frames, switches CR3 between them, then restores the
+ * Limine/kernel root. This validates paging isolation primitives, not ring-3
+ * execution, syscalls, scheduling, or a complete process implementation.
+ * ========================================================================== */
+static int address_space_self_test(void)
+{
+    struct vmm_address_space first = {0};
+    struct vmm_address_space second = {0};
+    const uint64_t test_va = 0x0000000000400000ULL;
+    const uint64_t pattern_a = 0x4853505249414153ULL;
+    const uint64_t pattern_b = 0x4853505249414253ULL;
+    uint64_t phys_a = 0;
+    uint64_t phys_b = 0;
+    int ok = 0;
+
+    if (!vmm_address_space_create(&first) ||
+        !vmm_address_space_create(&second))
+        goto cleanup;
+
+    if (!vmm_address_space_map_user_page(
+            &first, test_va, VMM_PROT_USER | VMM_PROT_WRITE, &phys_a) ||
+        !vmm_address_space_map_user_page(
+            &second, test_va, VMM_PROT_USER | VMM_PROT_WRITE, &phys_b))
+        goto cleanup;
+
+    if (!phys_a || !phys_b || phys_a == phys_b)
+        goto cleanup;
+
+    struct vmm_mapping_info map_a;
+    struct vmm_mapping_info map_b;
+    if (!vmm_address_space_query(&first, test_va, &map_a) ||
+        !vmm_address_space_query(&second, test_va, &map_b) ||
+        !map_a.user || !map_b.user || !map_a.writable || !map_b.writable ||
+        map_a.executable || map_b.executable ||
+        (map_a.physical_address & ~(VMM_PAGE_SIZE - 1ULL)) != phys_a ||
+        (map_b.physical_address & ~(VMM_PAGE_SIZE - 1ULL)) != phys_b)
+        goto cleanup;
+
+    volatile uint64_t *page_a =
+        (volatile uint64_t *)pmm_phys_to_virt(phys_a);
+    volatile uint64_t *page_b =
+        (volatile uint64_t *)pmm_phys_to_virt(phys_b);
+    if (!page_a || !page_b)
+        goto cleanup;
+    page_a[0] = pattern_a;
+    page_b[0] = pattern_b;
+    if (page_a[0] != pattern_a || page_b[0] != pattern_b)
+        goto cleanup;
+
+    uint64_t high_entry = 0;
+    if (!vmm_read_table_entry(first.root_phys, 256, &high_entry) ||
+        (high_entry & (1ULL << 2)))
+        goto cleanup;
+    if (!vmm_read_table_entry(first.root_phys, 511, &high_entry) ||
+        (high_entry & (1ULL << 2)))
+        goto cleanup;
+
+    if (!vmm_address_space_activate(&first) ||
+        vmm_root_phys() != first.root_phys)
+        goto cleanup;
+    struct vmm_mapping_info active_info;
+    if (!vmm_query_mapping(test_va, &active_info) || !active_info.user ||
+        (active_info.physical_address & ~(VMM_PAGE_SIZE - 1ULL)) != phys_a)
+        goto cleanup;
+
+    if (!vmm_address_space_activate(&second) ||
+        vmm_root_phys() != second.root_phys ||
+        !vmm_query_mapping(test_va, &active_info) || !active_info.user ||
+        (active_info.physical_address & ~(VMM_PAGE_SIZE - 1ULL)) != phys_b)
+        goto cleanup;
+
+    ok = 1;
+
+cleanup:
+    if (!vmm_activate_kernel_address_space())
+        return 0;
+    if (first.valid && !vmm_address_space_destroy(&first))
+        ok = 0;
+    if (second.valid && !vmm_address_space_destroy(&second))
+        ok = 0;
+    return ok;
+}
 
 /* =========================================
  * KERNEL ENTRY
@@ -779,20 +982,150 @@ void kmain(void) {
     console_print_u64(vmm_paging_levels());
     console_print("\n[VMM ] Bootstrap inspection PASS.\n");
 
+    /* Read-only PML4 inspection and entry decoding. */
     uint64_t root_entries = 0;
-
-    console_print("[VMM ] Inspecting root page table...\n");
-
     if (!vmm_inspect_root(&root_entries)) {
-        console_print("[VMM ] Root inspection FAILED.\n");
+        console_print("[VMM ] Root inspection FAILED!\n");
         halt_cpu();
     }
 
     console_print("[VMM ] Present root entries: ");
     console_print_u64(root_entries);
     console_print("/512\n");
+    console_print("[VMM ] Decoding present root entries...\n");
 
-    console_print("[VMM ] Root inspection PASS.\n");
+    for (uint16_t i = 0; i < 512; i++) {
+        uint64_t entry = 0;
+        if (!vmm_read_root_entry(i, &entry)) {
+            console_print("[VMM ] Root entry read FAILED!\n");
+            halt_cpu();
+        }
+
+        if (!(entry & 1ULL))
+            continue;
+
+        console_print("[VMM ] Entry Index : ");
+        console_print_u64(i);
+        console_print("\n[VMM ] Raw Entry   : ");
+        console_print_hex(entry);
+        console_print("\n[VMM ] Child Phys  : ");
+        console_print_hex(entry & 0x000FFFFFFFFFF000ULL);
+        console_print("\n[VMM ] Present     : ");
+        console_print_u64((entry >> 0) & 1ULL);
+        console_print("\n[VMM ] Writable    : ");
+        console_print_u64((entry >> 1) & 1ULL);
+        console_print("\n[VMM ] User        : ");
+        console_print_u64((entry >> 2) & 1ULL);
+        console_print("\n[VMM ] NX          : ");
+        console_print_u64((entry >> 63) & 1ULL);
+        console_print("\n");
+    }
+
+    console_print("[VMM ] Root entry decoding PASS.\n");
+
+    /* =========================================
+     * KERNEL MEMORY PROTECTION
+     * ========================================= */
+
+    console_print("[MPRO] Enabling CR0.WP and EFER.NXE...\n");
+    if (!vmm_enable_protection()) {
+        console_print("[MPRO] CPU protection setup FAILED!\n");
+        halt_cpu();
+    }
+
+    console_print("[MPRO] CR0.WP: enabled\n");
+    console_print("[MPRO] EFER.NXE: ");
+    console_print(vmm_nx_enabled() ? "enabled\n" : "disabled\n");
+
+    console_print("[MPRO] Protecting kernel sections...\n");
+
+    if (!vmm_protect_range_and_hhdm_alias(
+            (uint64_t)(uintptr_t)__kernel_requests_start,
+            (uint64_t)(uintptr_t)__kernel_requests_end,
+            0, 0) ||
+        !vmm_protect_range_and_hhdm_alias(
+            (uint64_t)(uintptr_t)__kernel_text_start,
+            (uint64_t)(uintptr_t)__kernel_text_end,
+            VMM_PROT_EXEC, 0) ||
+        !vmm_protect_range_and_hhdm_alias(
+            (uint64_t)(uintptr_t)__kernel_rodata_start,
+            (uint64_t)(uintptr_t)__kernel_rodata_end,
+            0, 0) ||
+        !vmm_protect_range_and_hhdm_alias(
+            (uint64_t)(uintptr_t)__kernel_data_start,
+            (uint64_t)(uintptr_t)__kernel_bss_end,
+            VMM_PROT_WRITE, VMM_PROT_WRITE)) {
+        console_print("[MPRO] Kernel section protection FAILED!\n");
+        halt_cpu();
+    }
+
+    if (!verify_kernel_section_permissions()) {
+        console_print("[MPRO] Permission verification FAILED!\n");
+        halt_cpu();
+    }
+
+    console_print("[MPRO] .text   : R-X / supervisor\n");
+    console_print("[MPRO] .rodata : R-- / supervisor\n");
+    console_print("[MPRO] .data   : RW- / supervisor\n");
+    console_print("[MPRO] .bss    : RW- / supervisor\n");
+    console_print("[MPRO] W^X verification PASS.\n");
+
+#if HISPERIA_RUN_MPROTECT_TEST == 1
+    console_print("[TEST] Writing to protected .rodata; #PF is expected.\n");
+    *(volatile uint64_t *)(uintptr_t)&vmm_rodata_probe = 0xBAD0BAD0BAD0BAD0ULL;
+    console_print("[TEST] ERROR: read-only write did not fault.\n");
+    halt_cpu();
+#elif HISPERIA_RUN_MPROTECT_TEST == 2
+    console_print("[TEST] Executing protected .data; #PF is expected.\n");
+    __asm__ volatile (
+        "call *%0"
+        :: "r"((uintptr_t)&vmm_data_probe)
+        : "memory"
+    );
+    console_print("[TEST] ERROR: NX execution did not fault.\n");
+    halt_cpu();
+#endif
+
+    /* Guarded IST stack: low guard page remains deliberately unmapped. */
+    uint64_t ist_guard = 0, ist_bottom = 0, ist_top = 0;
+    console_print("[STK ] Allocating guarded IST1 stack...\n");
+    if (!kernel_guarded_ist_stack_init(&ist_guard, &ist_bottom, &ist_top)) {
+        console_print("[STK ] Guarded stack initialization FAILED!\n");
+        halt_cpu();
+    }
+    struct vmm_mapping_info stack_map;
+    if (vmm_query_mapping(ist_guard, &stack_map) ||
+        !vmm_query_mapping(ist_bottom, &stack_map) ||
+        stack_map.writable != 1 || stack_map.executable != 0 ||
+        !gdt_ist1_verify(&ist1_top) || ist1_top != ist_top) {
+        console_print("[STK ] Guard-page/IST verification FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[STK ] Guard page unmapped; IST1 stack mapped RW/NX. PASS.\n");
+
+    /* Page-backed kernel heap with split/coalesce and free validation. */
+    console_print("[HEAP] Initializing kernel heap...\n");
+    if (!kheap_init()) {
+        console_print("[HEAP] Initialization FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[HEAP] Running allocator self-test...\n");
+    if (!kheap_self_test()) {
+        console_print("[HEAP] Alloc/free self-test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[HEAP] Alloc/free/split/coalesce test PASS.\n");
+    console_print("[HEAP] Mapped bytes: ");
+    console_print_u64(kheap_bytes_mapped());
+    console_print("\n");
+
+    /* Two isolated user address spaces; no ring-3 entry is attempted yet. */
+    console_print("[AS  ] Running address-space isolation self-test...\n");
+    if (!address_space_self_test()) {
+        console_print("[AS  ] Address-space isolation test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[AS  ] Separate user mappings + CR3 switch + kernel-half isolation PASS.\n");
 
     console_print("[INFO] Kernel initialization complete.\n");
     console_print("\n");

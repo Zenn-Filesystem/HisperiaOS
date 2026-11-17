@@ -16,7 +16,9 @@ C_SRC := \
     src/idt.c \
     src/isr.c \
     src/pmm.c \
-    src/vmm.c
+    src/vmm.c \
+    src/stack.c \
+    src/heap.c
 
 ASM_SRC := \
     src/gdt_load.S \
@@ -39,6 +41,7 @@ LIMINE_CONF := limine.conf
 # =========================================
 
 RUN_EXCEPTION_TEST ?= 0
+RUN_MPROTECT_TEST ?= 0
 
 CFLAGS := \
     --target=x86_64-unknown-none-elf \
@@ -62,6 +65,7 @@ CFLAGS := \
     -MMD -MP
 
 CFLAGS += -DHISPERIA_RUN_EXCEPTION_TEST=$(RUN_EXCEPTION_TEST)
+CFLAGS += -DHISPERIA_RUN_MPROTECT_TEST=$(RUN_MPROTECT_TEST)
 
 # =========================================
 # LINKER FLAGS
@@ -77,7 +81,7 @@ LDFLAGS := \
 # DEFAULT
 # =========================================
 
-.PHONY: all kernel iso run clean help
+.PHONY: all kernel iso run clean help validate
 
 all: kernel
 
@@ -207,6 +211,9 @@ clean:
 	rm -rf $(BUILD_DIR)
 	@echo "[CLEAN] Build directory removed."
 
+validate:
+	./tools/validate.sh
+
 # =========================================
 # HELP
 # =========================================
@@ -219,4 +226,7 @@ help:
 	@echo "make iso    - Generate bootable ISO"
 	@echo "make run    - Run ISO using QEMU"
 	@echo "make RUN_EXCEPTION_TEST=1 - Enable deliberate exception test"
+	@echo "make RUN_MPROTECT_TEST=1 - Test RO write protection (expected #PF)"
+	@echo "make RUN_MPROTECT_TEST=2 - Test NX execution protection (expected #PF)"
+	@echo "make validate - Compile normal + both fault-test configurations"
 	@echo "make clean  - Clean build files"

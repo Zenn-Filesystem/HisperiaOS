@@ -1,10 +1,8 @@
-# Build output
 /build/
-
-# Generated images and local archives
 *.iso
 *.zip
+*.o
+*.d
+*.elf
+*.log
 
-# Editor / OS noise
-*~
-.DS_Store
