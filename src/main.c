@@ -4,6 +4,7 @@
 #include "gdt.h"
 #include "idt.h"
 #include "interrupt.h"
+#include "pmm.h"
 
 /* =========================================
  * LIMINE COMPATIBILITY
@@ -44,6 +45,18 @@ static volatile uint64_t request_end[] =
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_framebuffer_request framebuffer_request = {
     .id = HISPERIA_FB_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
     .revision = 0
 };
 
@@ -717,6 +730,16 @@ void kmain(void) {
     } else {
         console_print("[GFX ] Framebuffer unavailable.\n");
     }
+
+    if (!memmap_request.response || !hhdm_request.response ||
+        !pmm_init(memmap_request.response, hhdm_request.response->offset)) {
+        console_print("[PMM ] Initialization FAILED.\n");
+        halt_cpu();
+    }
+
+    console_print("[PMM ] Free frames: ");
+    console_print_u64(pmm_free_frames());
+    console_print("\n");
 
     console_print("[INFO] Kernel initialization complete.\n");
     console_print("\n");

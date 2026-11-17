@@ -89,7 +89,8 @@ C_SRC := \
     src/main.c \
     src/gdt.c \
     src/idt.c \
-    src/isr.c
+    src/isr.c \
+    src/pmm.c
 
 ASM_SRC := \
     src/gdt_load.S \
