@@ -1,18 +1,10 @@
-# Build artifacts
-build/
-*.o
-*.elf
+# Build output
+/build/
+
+# Generated images and local archives
 *.iso
-
-# Debug artifacts
-*.log
-*.dump
-
-# Editor
-.vscode/
-.idea/
-
-# Temporary files
-*.tmp
-*~
 *.zip
+
+# Editor / OS noise
+*~
+.DS_Store

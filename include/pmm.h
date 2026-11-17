@@ -50,6 +50,9 @@ int pmm_free(uint64_t addr);
 /* Jumlah frame bebas saat ini. */
 uint64_t pmm_free_frames(void);
 
+/* Self-test alokasi, akses HHDM, invalid-free, dan double-free. */
+int pmm_self_test(void);
+
 /* Byte RAM USABLE di atas PMM_MAX_PHYS yang tidak dilacak. */
 uint64_t pmm_ignored_bytes(void);
 

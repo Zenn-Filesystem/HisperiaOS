@@ -221,6 +221,71 @@ uint64_t pmm_free_frames(void)
     return free_frames;
 }
 
+int pmm_self_test(void)
+{
+    const uint64_t free_before = pmm_free_frames();
+    const uint64_t pattern_a = 0x4853505249413031ULL; /* "HSPR IA01" */
+    const uint64_t pattern_b = 0x504D4D5445535432ULL; /* "PMMTEST2" */
+
+    uint64_t frame_a = pmm_alloc();
+    if (!frame_a)
+        return 0;
+
+    uint64_t frame_b = pmm_alloc();
+    if (!frame_b) {
+        (void)pmm_free(frame_a);
+        return 0;
+    }
+
+    int ok = 1;
+
+    if ((frame_a & (PMM_PAGE_SIZE - 1)) != 0 ||
+        (frame_b & (PMM_PAGE_SIZE - 1)) != 0 ||
+        frame_a == frame_b ||
+        free_before < 2 ||
+        pmm_free_frames() != free_before - 2)
+        ok = 0;
+
+    /* Touch two distinct allocated physical pages through the HHDM. */
+    volatile uint64_t *page_a =
+        (volatile uint64_t *)pmm_phys_to_virt(frame_a);
+    volatile uint64_t *page_b =
+        (volatile uint64_t *)pmm_phys_to_virt(frame_b);
+
+    *page_a = pattern_a;
+    *page_b = pattern_b;
+
+    if (*page_a != pattern_a || *page_b != pattern_b)
+        ok = 0;
+
+    /* Invalid frees must be rejected without changing allocator state. */
+    if (pmm_free(0) != 0 || pmm_free(frame_a + 1) != 0)
+        ok = 0;
+
+    int freed_a = pmm_free(frame_a);
+    if (!freed_a)
+        ok = 0;
+
+    /* A second free of the same frame must be rejected. */
+    if (pmm_free(frame_a) != 0)
+        ok = 0;
+
+    int freed_b = pmm_free(frame_b);
+    if (!freed_b)
+        ok = 0;
+
+    /* Best-effort cleanup if a broken free path rejected a valid frame. */
+    if (!freed_a)
+        (void)pmm_free(frame_a);
+    if (!freed_b)
+        (void)pmm_free(frame_b);
+
+    if (pmm_free_frames() != free_before)
+        ok = 0;
+
+    return ok;
+}
+
 uint64_t pmm_ignored_bytes(void)
 {
     return ignored_bytes;

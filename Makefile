@@ -10,12 +10,21 @@ LD := ld.lld
 BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
 
-C_SRC := src/main.c src/gdt.c
-ASM_SRC := src/gdt_load.S
+C_SRC := \
+    src/main.c \
+    src/gdt.c \
+    src/idt.c \
+    src/isr.c \
+    src/pmm.c \
+    src/vmm.c
 
-OBJ := \
-    $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(C_SRC)) \
-    $(patsubst src/%.S,$(BUILD_DIR)/%.o,$(ASM_SRC))
+ASM_SRC := \
+    src/gdt_load.S \
+    src/isr.S
+
+C_OBJ := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(C_SRC))
+ASM_OBJ := $(patsubst src/%.S,$(BUILD_DIR)/%.asm.o,$(ASM_SRC))
+OBJ := $(C_OBJ) $(ASM_OBJ)
 
 KERNEL := $(BUILD_DIR)/kernel.elf
 ISO := $(BUILD_DIR)/hisperia.iso
@@ -28,6 +37,8 @@ LIMINE_CONF := limine.conf
 # =========================================
 # COMPILER FLAGS
 # =========================================
+
+RUN_EXCEPTION_TEST ?= 0
 
 CFLAGS := \
     --target=x86_64-unknown-none-elf \
@@ -49,6 +60,8 @@ CFLAGS := \
     -mno-sse2 \
     -Iinclude \
     -MMD -MP
+
+CFLAGS += -DHISPERIA_RUN_EXCEPTION_TEST=$(RUN_EXCEPTION_TEST)
 
 # =========================================
 # LINKER FLAGS
@@ -84,25 +97,6 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/%.asm.o: src/%.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
-
-C_SRC := \
-    src/main.c \
-    src/gdt.c \
-    src/idt.c \
-    src/isr.c \
-    src/pmm.c
-
-ASM_SRC := \
-    src/gdt_load.S \
-    src/isr.S
-
-C_OBJ := \
-    $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(C_SRC))
-
-ASM_OBJ := \
-    $(patsubst src/%.S,$(BUILD_DIR)/%.asm.o,$(ASM_SRC))
-
-OBJ := $(C_OBJ) $(ASM_OBJ)
 
 # Header dependency tracking: ubah include/*.h -> objek terkait dibangun ulang.
 -include $(OBJ:.o=.d)
@@ -224,4 +218,5 @@ help:
 	@echo "make kernel - Build kernel"
 	@echo "make iso    - Generate bootable ISO"
 	@echo "make run    - Run ISO using QEMU"
+	@echo "make RUN_EXCEPTION_TEST=1 - Enable deliberate exception test"
 	@echo "make clean  - Clean build files"

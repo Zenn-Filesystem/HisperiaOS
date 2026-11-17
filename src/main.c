@@ -5,6 +5,7 @@
 #include "idt.h"
 #include "interrupt.h"
 #include "pmm.h"
+#include "vmm.h"
 
 /* =========================================
  * LIMINE COMPATIBILITY
@@ -593,6 +594,11 @@ static void halt_cpu(void) {
  * EXCEPTION TESTS
  * ========================================= */
 
+#ifndef HISPERIA_RUN_EXCEPTION_TEST
+#define HISPERIA_RUN_EXCEPTION_TEST 0
+#endif
+
+#if HISPERIA_RUN_EXCEPTION_TEST
 #define EXCEPTION_TEST 2   /* 0 = int3, 1 = ud2, 2 = #GP */
 
 static void run_exception_test(int which)
@@ -610,6 +616,7 @@ static void run_exception_test(int which)
         break;
     }
 }
+#endif /* HISPERIA_RUN_EXCEPTION_TEST */
 
 /* =========================================
  * KERNEL ENTRY
@@ -741,15 +748,61 @@ void kmain(void) {
     console_print_u64(pmm_free_frames());
     console_print("\n");
 
+    console_print("[PMM ] Running allocator self-test...\n");
+    if (pmm_self_test()) {
+        console_print("[PMM ] Allocation/HHDM/free test PASS.\n");
+    } else {
+        console_print("[PMM ] Allocation/HHDM/free test FAILED!\n");
+        halt_cpu();
+    }
+
+    console_print("[PMM ] Free frames after test: ");
+    console_print_u64(pmm_free_frames());
+    console_print("\n");
+
+    /* =========================================
+     * VMM BOOTSTRAP — INSPECT, DO NOT REMAP
+     * ========================================= */
+
+    console_print("[VMM ] Inspecting active paging context...\n");
+
+    if (!vmm_bootstrap_init()) {
+        console_print("[VMM ] Active paging context FAILED.\n");
+        halt_cpu();
+    }
+
+    console_print("[VMM ] CR3 value       : ");
+    console_print_hex(vmm_cr3_value());
+    console_print("\n[VMM ] Root table phys : ");
+    console_print_hex(vmm_root_phys());
+    console_print("\n[VMM ] Paging levels   : ");
+    console_print_u64(vmm_paging_levels());
+    console_print("\n[VMM ] Bootstrap inspection PASS.\n");
+
+    uint64_t root_entries = 0;
+
+    console_print("[VMM ] Inspecting root page table...\n");
+
+    if (!vmm_inspect_root(&root_entries)) {
+        console_print("[VMM ] Root inspection FAILED.\n");
+        halt_cpu();
+    }
+
+    console_print("[VMM ] Present root entries: ");
+    console_print_u64(root_entries);
+    console_print("/512\n");
+
+    console_print("[VMM ] Root inspection PASS.\n");
+
     console_print("[INFO] Kernel initialization complete.\n");
     console_print("\n");
     console_print("Welcome to HisperiaOS!\n");
 
+#if HISPERIA_RUN_EXCEPTION_TEST
     console_print("[TEST] Triggering exception test...\n");
-
     run_exception_test(EXCEPTION_TEST);
-
     console_print("[ERROR] Test unexpectedly returned!\n");
+#endif
 
-    halt_cpu(); 
+    halt_cpu();
 }
