@@ -162,14 +162,35 @@ void ring3_syscall_dispatch(struct ring3_syscall_frame *frame)
         return;
     }
 
-    case SYS_EXIT:
+    case SYS_EXIT: {
+        /*
+         * In 64-bit mode IRETQ always consumes the complete five-qword
+         * return frame, including RSP and SS even when returning to CPL0.
+         * The syscall arrived on the dedicated TSS.RSP0 stack, so the
+         * address immediately after this frame is its original stack top.
+         * Do not leave the user RSP/SS (0x2B) in a Ring-0 return frame.
+         */
+        uintptr_t kernel_resume_rsp =
+            (uintptr_t)frame + sizeof(*frame);
+        uintptr_t kernel_stack_bottom = (uintptr_t)ring3_kernel_stack;
+        uintptr_t kernel_stack_top =
+            kernel_stack_bottom + sizeof(ring3_kernel_stack);
+
+        if (kernel_resume_rsp != kernel_stack_top ||
+            (kernel_resume_rsp & 0xFULL) != 0) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
         exit_status = frame->rdi;
         frame->rip = (uint64_t)(uintptr_t)ring3_exit_trampoline;
         frame->cs = GDT_KERNEL_CODE_SELECTOR;
-        /* Return to Ring 0 with interrupts disabled and IOPL cleared. */
-        frame->rflags = 0x2ULL;
+        frame->rflags = 0x2ULL; /* IF=0, IOPL=0, reserved bit 1 set. */
+        frame->rsp = (uint64_t)kernel_resume_rsp;
+        frame->ss = GDT_KERNEL_DATA_SELECTOR;
         frame->rax = 0;
         return;
+    }
 
     default:
         frame->rax = (uint64_t)-1;

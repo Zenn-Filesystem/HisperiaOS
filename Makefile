@@ -6,6 +6,7 @@ PROJECT := HisperiaOS
 
 CC := clang
 LD := ld.lld
+HOSTCC ?= cc
 
 BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
@@ -19,7 +20,13 @@ C_SRC := \
     src/vmm.c \
     src/stack.c \
     src/heap.c \
-    src/ring3.c
+    src/ring3.c \
+    src/blockdev.c \
+    src/partition.c \
+    src/fat32.c \
+    src/ata_pio.c \
+    src/pci.c \
+    src/ahci.c
 
 ASM_SRC := \
     src/gdt_load.S \
@@ -84,7 +91,7 @@ LDFLAGS := \
 # DEFAULT
 # =========================================
 
-.PHONY: all kernel iso run clean help validate
+.PHONY: all kernel iso run fat32-disk run-fat32 qemu-fat32 run-sata qemu-sata test-storage-host clean help validate
 
 all: kernel
 
@@ -206,6 +213,57 @@ run: iso
 	    -no-reboot \
 	    -no-shutdown
 
+# 128 MiB MBR-partitioned FAT32 disk image for the legacy IDE PIO test.
+FAT32_DISK := $(BUILD_DIR)/fat32-disk.img
+
+fat32-disk: $(FAT32_DISK)
+
+$(FAT32_DISK): tools/create_fat32_image.py | $(BUILD_DIR)
+	python3 tools/create_fat32_image.py $@ 128
+
+# Uses i440fx/legacy IDE so the primary-master ATA PIO driver can read the disk.
+run-fat32: iso fat32-disk
+	qemu-system-x86_64 \
+	    -M pc \
+	    -m 256M \
+	    -cdrom $(ISO) \
+	    -drive file=$(FAT32_DISK),format=raw,if=ide,index=0,media=disk \
+	    -boot order=d \
+	    -serial stdio \
+	    -monitor none \
+	    -no-reboot \
+	    -no-shutdown
+
+qemu-fat32: run-fat32
+
+# AHCI SATA test: q35 + ICH9 AHCI controller + SATA disk on port 0.
+run-sata: iso fat32-disk
+	qemu-system-x86_64 \
+	    -M q35 \
+	    -m 256M \
+	    -cdrom $(ISO) \
+	    -device ich9-ahci,id=ahci \
+	    -drive file=$(FAT32_DISK),format=raw,if=none,id=satadisk \
+	    -device ide-hd,drive=satadisk,bus=ahci.0 \
+	    -boot order=d \
+	    -serial stdio \
+	    -monitor none \
+	    -no-reboot \
+	    -no-shutdown
+
+qemu-sata: run-sata
+
+# Pure host-side tests for the sector layer, partition parsers and FAT32 BPB.
+HOST_STORAGE_TEST := $(BUILD_DIR)/storage-host-test
+
+test-storage-host: $(HOST_STORAGE_TEST)
+	$(HOST_STORAGE_TEST)
+
+$(HOST_STORAGE_TEST): tools/storage_host_test.c src/blockdev.c src/partition.c src/fat32.c | $(BUILD_DIR)
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
+	    tools/storage_host_test.c src/blockdev.c src/partition.c src/fat32.c \
+	    -o $@
+
 # =========================================
 # CLEAN
 # =========================================
@@ -227,7 +285,11 @@ help:
 	@echo "make        - Build kernel"
 	@echo "make kernel - Build kernel"
 	@echo "make iso    - Generate bootable ISO"
-	@echo "make run    - Run ISO using QEMU"
+	@echo "make run    - Run ISO using QEMU (q35, no disk test)"
+	@echo "make fat32-disk - Create an MBR + FAT32 test disk image"
+	@echo "make run-fat32 - Boot with a FAT32 disk on legacy IDE PIO"
+	@echo "make qemu-fat32 - Alias for run-fat32"
+	@echo "make test-storage-host - Run host-side block/partition/FAT32 tests"
 	@echo "make RUN_EXCEPTION_TEST=1 - Enable deliberate exception test"
 	@echo "make RUN_MPROTECT_TEST=1 - Test RO write protection (expected #PF)"
 	@echo "make RUN_MPROTECT_TEST=2 - Test NX execution protection (expected #PF)"

@@ -7,6 +7,7 @@ A freestanding x86-64 kernel in C and x86-64 assembly, booted with Limine (base 
 - Limine boot handoff, framebuffer output, COM1 serial diagnostics
 - GDT, TSS, IDT, IST1, and CPU exception reporting
 - Bitmap PMM with 4 KiB frames, allocation/free validation, and HHDM access
+- Dedicated supervisor MMIO virtual window with PCD+PWT mappings for PCI device registers
 - Four-level x86-64 page-table inspection and mapping walker
 - 1 GiB / 2 MiB huge-page splitting when a 4 KiB permission change is needed
 - CR0.WP + EFER.NXE activation
@@ -130,3 +131,22 @@ After building and booting the normal kernel, the serial output should include:
 ## Repository hygiene
 
 Generated build output, ELF / ISO files, object and dependency files, logs, and ZIP archives are ignored by Git.
+
+
+## Storage foundation (Block Device / MBR-GPT / FAT32)
+
+The first read-only storage stack is in place. `blockdev` provides a 512-byte
+sector interface, a writable RAM-disk backend is used by kernel self-tests,
+`partition` parses primary MBR and GPT (including CRC32 checks), and `fat32`
+validates FAT32 BPB geometry and mounts a volume read-only. A polling primary-
+master ATA PIO driver is included for the first QEMU disk test.
+
+Run the host-side parser tests with `make test-storage-host`. To create a
+128 MiB MBR/FAT32 image and boot it as a legacy IDE disk in QEMU, use
+`make run-fat32`. This test uses `-M pc` intentionally because AHCI/NVMe are not
+implemented. FAT directory traversal, file reads/writes, VFS, and GBA ROM loading
+remain future work. See `STORAGE-README.md` for details and expected serial logs.
+
+## AHCI SATA (experimental)
+
+See `AHCI-README.md`. Build with `make validate`; test the AHCI path with `make run-sata` on a host with QEMU, xorriso, and dosfstools installed. The initial AHCI backend is polling and read-only; physical hardware support is not yet verified.

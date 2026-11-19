@@ -9,6 +9,11 @@
 #include "stack.h"
 #include "heap.h"
 #include "ring3.h"
+#include "blockdev.h"
+#include "partition.h"
+#include "fat32.h"
+#include "ata_pio.h"
+#include "ahci.h"
 
 #ifndef HISPERIA_RUN_EXCEPTION_TEST
 #define HISPERIA_RUN_EXCEPTION_TEST 0
@@ -1151,6 +1156,108 @@ void kmain(void) {
         halt_cpu();
     }
     console_print("[AS  ] Separate user mappings + CR3 switch + kernel-half isolation PASS.\n");
+
+    /* =========================================
+     * STORAGE FOUNDATION: BLOCKDEV + PARTITIONS + FAT32 BPB
+     * ========================================= */
+
+    console_print("[BLK ] Running RAM-disk block-device self-test...\n");
+    if (!blockdev_ramdisk_self_test()) {
+        console_print("[BLK ] RAM-disk read/write test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[BLK ] RAM-disk read/write/bounds test PASS.\n");
+
+    console_print("[PART] Running MBR/GPT parser self-test...\n");
+    if (!partition_self_test()) {
+        console_print("[PART] MBR/GPT parser self-test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[PART] MBR + GPT + CRC validation test PASS.\n");
+
+    console_print("[FAT ] Running FAT32 BPB validation self-test...\n");
+    if (!fat32_bpb_self_test()) {
+        console_print("[FAT ] BPB validation self-test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[FAT ] FAT32 BPB geometry validation PASS.\n");
+
+    console_print("[ATA ] Probing QEMU primary-master IDE device...\n");
+    struct block_device ata_disk = {0};
+    if (ata_pio_init_primary_master(&ata_disk)) {
+        console_print("[ATA ] Device: ");
+        console_print(ata_disk.name);
+        console_print(" | sectors: ");
+        console_print_u64(ata_disk.sector_count);
+        console_print(" | LBA28 PIO read-only.\n");
+
+        struct partition_entry partitions[16];
+        size_t partition_count = 0;
+        if (!partition_scan(&ata_disk, partitions, 16, &partition_count)) {
+            console_print("[PART] Disk partition table invalid or unreadable.\n");
+        } else {
+            console_print("[PART] Detected partitions: ");
+            console_print_u64(partition_count);
+            console_print("\n");
+
+            int fat_mounted = 0;
+            for (size_t i = 0; i < partition_count; i++) {
+                struct fat32_fs filesystem = {0};
+                if (fat32_mount(&filesystem, &ata_disk, &partitions[i])) {
+                    console_print("[FAT ] FAT32 mounted read-only: ");
+                    console_print(filesystem.volume_label);
+                    console_print(" | clusters: ");
+                    console_print_u64(filesystem.cluster_count);
+                    console_print(" | root cluster: ");
+                    console_print_u64(filesystem.root_cluster);
+                    console_print("\n");
+                    fat_mounted = 1;
+                    break;
+                }
+            }
+            if (!fat_mounted)
+                console_print("[FAT ] No valid FAT32 volume found on IDE disk.\n");
+        }
+    } else {
+        console_print("[ATA ] No primary-master IDE disk detected; QEMU FAT32 test skipped.\n");
+    }
+
+    /* AHCI SATA backend: independent of legacy IDE PIO. */
+    console_print("[AHCI] Scanning PCI for AHCI controller...\n");
+    struct block_device sata_disk = {0};
+    if (ahci_init(&sata_disk)) {
+        console_print("[AHCI] Device: ");
+        console_print(sata_disk.name);
+        console_print(" | sectors: ");
+        console_print_u64(sata_disk.sector_count);
+        console_print(" | SATA READ DMA EXT, polling, read-only.\n");
+        struct partition_entry sata_parts[16];
+        size_t sata_part_count = 0;
+        if (!partition_scan(&sata_disk, sata_parts, 16, &sata_part_count)) {
+            console_print("[PART] AHCI partition table invalid or unreadable.\n");
+        } else {
+            console_print("[PART] AHCI partitions detected: ");
+            console_print_u64(sata_part_count);
+            console_print("\n");
+            int sata_fat_mounted = 0;
+            for (size_t i = 0; i < sata_part_count; i++) {
+                struct fat32_fs sata_fs = {0};
+                if (fat32_mount(&sata_fs, &sata_disk, &sata_parts[i])) {
+                    console_print("[FAT ] AHCI FAT32 mounted read-only: ");
+                    console_print(sata_fs.volume_label);
+                    console_print("\n");
+                    sata_fat_mounted = 1;
+                    break;
+                }
+            }
+            if (!sata_fat_mounted)
+                console_print("[FAT ] No valid FAT32 volume found on AHCI disk.\n");
+        }
+    } else {
+        console_print("[AHCI] Initialization failed: ");
+        console_print(ahci_last_error());
+        console_print("\n");
+    }
 
     /* Execute a real user payload at CPL3, service int 0x80, and return. */
     console_print("[R3  ] Starting Ring 3 user-program test...\n");

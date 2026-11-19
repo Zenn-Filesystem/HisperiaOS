@@ -58,6 +58,8 @@ int vmm_protect_range_and_hhdm_alias(uint64_t start,
 /* 4 KiB supervisor mapping primitives in the currently active root. */
 int vmm_map_page(uint64_t virtual_address, uint64_t physical_address,
                  uint32_t protection);
+/* Map device MMIO in a dedicated virtual window using uncached PCD+PWT pages. */
+void *vmm_map_mmio(uint64_t physical_address, uint64_t length);
 int vmm_unmap_page(uint64_t virtual_address, uint64_t *physical_out);
 
 /* Isolated lower-half user address spaces; high-half kernel mappings are shared. */

@@ -1,8 +1,9 @@
 /build/
-*.iso
-*.zip
 *.o
 *.d
 *.elf
+*.iso
+*.img
 *.log
-
+*.zip
+__pycache__/

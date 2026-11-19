@@ -39,6 +39,11 @@ static int nx_is_enabled;
 static int vmm_ready;
 static int protection_ready;
 
+/* Dedicated supervisor-only virtual window for device MMIO mappings. */
+#define VMM_MMIO_BASE  0xFFFFC10000000000ULL
+#define VMM_MMIO_LIMIT 0xFFFFC11000000000ULL
+static uint64_t next_mmio_virtual = VMM_MMIO_BASE;
+
 static uint64_t read_cr3(void)
 {
     uint64_t value;
@@ -698,12 +703,14 @@ static int map_page_in_root(uint64_t root_phys,
                             uint64_t virtual_address,
                             uint64_t physical_address,
                             uint32_t protection,
-                            int user_mapping)
+                            int user_mapping,
+                            int uncached)
 {
     if (active_paging_levels != 4 ||
         (virtual_address & (VMM_PAGE_SIZE - 1ULL)) ||
         (physical_address & (VMM_PAGE_SIZE - 1ULL)) ||
-        physical_address == 0 || physical_address >= PMM_MAX_PHYS ||
+        physical_address == 0 || physical_address > physical_address_mask ||
+        (!uncached && physical_address >= PMM_MAX_PHYS) ||
         (protection & ~(VMM_PROT_MASK | VMM_PROT_USER)) ||
         ((protection & VMM_PROT_WRITE) &&
          (protection & VMM_PROT_EXEC)))
@@ -751,6 +758,8 @@ static int map_page_in_root(uint64_t root_phys,
         leaf |= PTE_USER_ADDRESS;
     if (!(protection & VMM_PROT_EXEC))
         leaf |= PTE_EXEC_DISABLE;
+    if (uncached)
+        leaf |= PTE_PCD | PTE_PWT;
 
     pt[i1] = leaf;
     __asm__ volatile ("mfence" ::: "memory");
@@ -766,7 +775,54 @@ int vmm_map_page(uint64_t virtual_address,
     if (!vmm_ready || !protection_ready)
         return 0;
     return map_page_in_root(active_root_phys, virtual_address,
-                            physical_address, protection, 0);
+                            physical_address, protection, 0, 0);
+}
+
+void *vmm_map_mmio(uint64_t physical_address, uint64_t length)
+{
+    if (!vmm_ready || !protection_ready || active_paging_levels != 4 ||
+        physical_address == 0 || length == 0 ||
+        physical_address > physical_address_mask ||
+        length - 1ULL > physical_address_mask - physical_address)
+        return 0;
+
+    const uint64_t page_mask = VMM_PAGE_SIZE - 1ULL;
+    uint64_t offset = physical_address & page_mask;
+    uint64_t physical_base = physical_address & ~page_mask;
+    if (length > UINT64_MAX - offset ||
+        length + offset > UINT64_MAX - page_mask)
+        return 0;
+    uint64_t span = (length + offset + page_mask) & ~page_mask;
+    if (span == 0 || next_mmio_virtual > VMM_MMIO_LIMIT ||
+        span > VMM_MMIO_LIMIT - next_mmio_virtual ||
+        VMM_PAGE_SIZE > VMM_MMIO_LIMIT - next_mmio_virtual - span)
+        return 0;
+
+    uint64_t virtual_base = next_mmio_virtual;
+    uint64_t mapped = 0;
+    for (; mapped < span; mapped += VMM_PAGE_SIZE) {
+        uint64_t va = virtual_base + mapped;
+        uint64_t pa = physical_base + mapped;
+
+        /* Never replace an existing mapping, even inside our MMIO window. */
+        struct vmm_mapping_info existing;
+        if (vmm_query_mapping(va, &existing) ||
+            !map_page_in_root(active_root_phys, va, pa,
+                              VMM_PROT_WRITE, 0, 1))
+            break;
+    }
+
+    if (mapped != span) {
+        while (mapped != 0) {
+            uint64_t ignored = 0;
+            mapped -= VMM_PAGE_SIZE;
+            (void)vmm_unmap_page(virtual_base + mapped, &ignored);
+        }
+        return 0;
+    }
+
+    next_mmio_virtual = virtual_base + span + VMM_PAGE_SIZE;
+    return (void *)(uintptr_t)(virtual_base + offset);
 }
 
 int vmm_unmap_page(uint64_t virtual_address, uint64_t *physical_out)
@@ -902,7 +958,7 @@ int vmm_address_space_map_user_page(struct vmm_address_space *space,
         page[i] = 0;
 
     if (!map_page_in_root(space->root_phys, virtual_address,
-                          phys, protection, 1)) {
+                          phys, protection, 1, 0)) {
         (void)pmm_free(phys);
         return 0;
     }
