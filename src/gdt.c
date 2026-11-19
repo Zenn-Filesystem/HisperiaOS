@@ -8,12 +8,14 @@
  * GDT
  * ========================================= */
 
-static uint64_t gdt[5] __attribute__((aligned(16))) = {
-    0x0000000000000000ULL, // Null
-    0x00AF9A000000FFFFULL, // Kernel Code
-    0x00CF92000000FFFFULL, // Kernel Data
-    0,                     // TSS low
-    0                      // TSS high
+static uint64_t gdt[7] __attribute__((aligned(16))) = {
+    0x0000000000000000ULL, // 0x00: Null
+    0x00AF9A000000FFFFULL, // 0x08: Kernel Code, DPL 0
+    0x00CF92000000FFFFULL, // 0x10: Kernel Data, DPL 0
+    0,                     // 0x18: TSS low
+    0,                     // 0x20: TSS high
+    0x00CFF2000000FFFFULL, // 0x28: User Data, DPL 3
+    0x00AFFA000000FFFFULL  // 0x30: User Code, DPL 3, 64-bit
 };
 
 /* =========================================
@@ -141,6 +143,32 @@ int gdt_tss_verify(uint16_t *selector_out)
         *selector_out = selector;
 
     return selector == 0x18;
+}
+
+/* =========================================
+ * USER SEGMENTS AND RING-0 ENTRY STACK
+ * ========================================= */
+
+int gdt_user_segments_verify(void)
+{
+    return gdt[5] == 0x00CFF2000000FFFFULL &&
+           gdt[6] == 0x00AFFA000000FFFFULL;
+}
+
+int gdt_set_rsp0(uintptr_t stack_top)
+{
+    if (!stack_top || (stack_top & 0xFULL))
+        return 0;
+
+    tss.rsp0 = (uint64_t)stack_top;
+    __asm__ volatile ("mfence" ::: "memory");
+    return tss.rsp0 == (uint64_t)stack_top;
+}
+
+int gdt_rsp0_verify(uintptr_t expected)
+{
+    return expected && !(expected & 0xFULL) &&
+           tss.rsp0 == (uint64_t)expected;
 }
 
 /* =========================================

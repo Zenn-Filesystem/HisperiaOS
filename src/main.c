@@ -8,6 +8,7 @@
 #include "vmm.h"
 #include "stack.h"
 #include "heap.h"
+#include "ring3.h"
 
 #ifndef HISPERIA_RUN_EXCEPTION_TEST
 #define HISPERIA_RUN_EXCEPTION_TEST 0
@@ -437,6 +438,16 @@ static void console_print(const char *str) {
         console_putchar(*str++);
 }
 
+/* Byte-oriented console API used by kernel services such as Ring 3 write(). */
+void kernel_console_write(const char *data, size_t length)
+{
+    if (!data)
+        return;
+
+    for (size_t i = 0; i < length; i++)
+        console_putchar(data[i]);
+}
+
 static void console_print_u64(uint64_t value) {
     char buffer[21];
     uint32_t index = 0;
@@ -862,6 +873,13 @@ void kmain(void) {
         console_print("[TSS ] Verification FAILED.\n");
     }
 
+    if (gdt_user_segments_verify()) {
+        console_print("[GDT ] Ring 3 code/data descriptors PASS.\n");
+    } else {
+        console_print("[GDT ] Ring 3 descriptor verification FAILED!\n");
+        halt_cpu();
+    }
+
     /* =========================================
      * IST INITIALIZATION
      * ========================================= */
@@ -908,6 +926,13 @@ void kmain(void) {
         console_print("[IDT ] IST Verification PASS.\n");
     } else {
         console_print("[IDT ] IST Verification FAILED!\n");
+        halt_cpu();
+    }
+
+    if (idt_syscall_gate_verify()) {
+        console_print("[IDT ] int 0x80 DPL3 gate PASS.\n");
+    } else {
+        console_print("[IDT ] int 0x80 gate verification FAILED!\n");
         halt_cpu();
     }
 
@@ -1119,13 +1144,21 @@ void kmain(void) {
     console_print_u64(kheap_bytes_mapped());
     console_print("\n");
 
-    /* Two isolated user address spaces; no ring-3 entry is attempted yet. */
+    /* Verify that separate processes receive distinct lower-half mappings. */
     console_print("[AS  ] Running address-space isolation self-test...\n");
     if (!address_space_self_test()) {
         console_print("[AS  ] Address-space isolation test FAILED!\n");
         halt_cpu();
     }
     console_print("[AS  ] Separate user mappings + CR3 switch + kernel-half isolation PASS.\n");
+
+    /* Execute a real user payload at CPL3, service int 0x80, and return. */
+    console_print("[R3  ] Starting Ring 3 user-program test...\n");
+    if (!ring3_run_self_test()) {
+        console_print("[R3  ] Ring 3 execution/syscall test FAILED!\n");
+        halt_cpu();
+    }
+    console_print("[R3  ] CPL3 execution + syscall + exit round-trip PASS.\n");
 
     console_print("[INFO] Kernel initialization complete.\n");
     console_print("\n");

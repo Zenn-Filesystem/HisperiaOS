@@ -11,6 +11,7 @@ int idt_verify(
 );
 
 int idt_df_ist_verify(uint8_t *ist_out);
+int idt_syscall_gate_verify(void);
 
 int idt_vector_uses_ist(uint8_t vector);
 

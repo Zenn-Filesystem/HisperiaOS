@@ -31,14 +31,15 @@ extern void *isr_stub_table[32];
 static void idt_set_gate(
     uint8_t vector,
     uintptr_t handler,
-    uint8_t ist
+    uint8_t ist,
+    uint8_t type_attr
 ) {
     struct idt_entry *entry = &idt[vector];
 
     entry->offset_low  = handler & 0xFFFF;
     entry->selector    = 0x08;
     entry->ist         = ist & 0x07;
-    entry->type_attr   = 0x8E;
+    entry->type_attr   = type_attr;
     entry->offset_mid  = (handler >> 16) & 0xFFFF;
     entry->offset_high = (handler >> 32) & 0xFFFFFFFF;
     entry->reserved    = 0;
@@ -58,9 +59,14 @@ void idt_init(void)
         idt_set_gate(
             i,
             (uintptr_t)isr_stub_table[i],
-            ist
+            ist,
+            0x8E
         );
     }
+
+    /* DPL 3 interrupt gate: user programs may invoke int 0x80. */
+    extern void isr128(void);
+    idt_set_gate(0x80, (uintptr_t)isr128, 0, 0xEE);
 
     __asm__ volatile (
         "lidt %0"
@@ -117,4 +123,13 @@ int idt_df_ist_verify(uint8_t *ist_out)
 int idt_vector_uses_ist(uint8_t vector)
 {
     return (idt[vector].ist & 0x07) != 0;
+}
+
+int idt_syscall_gate_verify(void)
+{
+    const struct idt_entry *entry = &idt[0x80];
+    return entry->selector == 0x08 &&
+           entry->ist == 0 &&
+           entry->type_attr == 0xEE &&
+           entry->reserved == 0;
 }

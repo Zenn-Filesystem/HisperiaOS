@@ -18,11 +18,14 @@ C_SRC := \
     src/pmm.c \
     src/vmm.c \
     src/stack.c \
-    src/heap.c
+    src/heap.c \
+    src/ring3.c
 
 ASM_SRC := \
     src/gdt_load.S \
-    src/isr.S
+    src/isr.S \
+    src/ring3.S \
+    src/user_program.S
 
 C_OBJ := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(C_SRC))
 ASM_OBJ := $(patsubst src/%.S,$(BUILD_DIR)/%.asm.o,$(ASM_SRC))
@@ -229,4 +232,5 @@ help:
 	@echo "make RUN_MPROTECT_TEST=1 - Test RO write protection (expected #PF)"
 	@echo "make RUN_MPROTECT_TEST=2 - Test NX execution protection (expected #PF)"
 	@echo "make validate - Compile normal + both fault-test configurations"
+	@echo "Ring 3 demo runs automatically during normal boot"
 	@echo "make clean  - Clean build files"

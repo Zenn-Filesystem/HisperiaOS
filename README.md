@@ -16,6 +16,10 @@ A freestanding x86-64 kernel in C and x86-64 assembly, booted with Limine (base 
 - Guarded IST1 stack: four mapped RW/NX pages with an unmapped lower guard page
 - Page-backed kernel heap with `kmalloc()` / `kfree()`, splitting, and adjacent free-block coalescing
 - Independent user address-space roots, private lower-half mappings, shared supervisor-only upper-half mappings, CR3 activation, query, unmap, and destroy APIs
+- Ring 3 GDT descriptors (DPL 3), TSS.RSP0 kernel-entry stack, and a DPL 3 `int 0x80` gate
+- First CPL3 payload copied into a user RX page, with a separate user RW/NX stack
+- Minimal syscall ABI: `write` (1) and `exit` (2), including bounded user-pointer validation/copy via the HHDM
+- Ring 3 exit trampoline that restores the kernel CR3, destroys the temporary address space, and resumes the suspended kernel caller
 
 ## Memory-protection policy
 
@@ -76,21 +80,44 @@ Normal startup runs:
 4. Heap allocation, data-integrity, free, and coalescing self-test.
 5. Two-address-space test: identical user VA mapped to distinct frames, user permission inspection, CR3 switching, kernel-half supervisor isolation, restoration of the kernel root, and destruction of both test spaces.
 
+## Ring 3 first-program milestone
+
+Normal boot now runs a tiny position-independent assembly payload at CPL3. It issues `int 0x80` with `write(1, user_buffer, length)`, checks the returned byte count, and then calls `exit(2, status)`. The syscall handler validates the caller privilege and user mappings, copies user data through the supervisor HHDM alias, and writes it to the kernel console. `SYS_EXIT` rewrites the interrupt return frame to a Ring 0 trampoline; the trampoline restores the kernel CR3, destroys the temporary address space, and returns to the suspended kernel call site.
+
+Selectors are kept stable for the existing kernel/TSS setup: kernel code `0x08`, kernel data `0x10`, TSS `0x18`, user data `0x2B`, and user code `0x33`. The syscall interrupt gate is vector `0x80`, selector `0x08`, type attributes `0xEE` (present, DPL 3, 64-bit interrupt gate).
+
+The demonstration is intentionally a single synchronous task. It is a real CPU CPL3 transition, but it is not yet an application environment: the payload is a built-in assembly blob rather than an ELF file, and the syscall ABI is deliberately tiny. User IF remains cleared because hardware IRQ handlers are not installed yet; software `int 0x80` works independently of IF.
+
 ## Address-space scope and limitations
 
 The address-space work is the kernel-side VM foundation, **not a complete process subsystem**. It can create independent four-level roots, populate user pages, switch CR3, inspect/unmap those pages, and free the private lower-half page-table tree. The high half is shared from the boot kernel root with the top-level U/S bit cleared.
 
 The following are not implemented yet:
 
-- ring-3 transition / user-mode entry and return
-- syscall ABI and syscall entry
-- ELF loader, user stack setup, and process image lifecycle
+- ELF loader and dynamic program loading
+- general process image lifecycle and robust per-process resources
 - scheduler and per-thread kernel stacks
+- user-mode exception delivery / process termination on faults (unexpected user exceptions currently reach the kernel fatal exception path)
 - SMP locking and TLB shootdown (the current implementation is single-CPU oriented)
 - five-level paging (LA57)
 - complete auditing of all possible physical aliases and memory types
 
 Do not run these APIs concurrently from multiple CPUs. Address-space destruction must only be done after switching away from that root on the running CPU.
+
+## Ring 3 boot validation
+
+After building and booting the normal kernel, the serial output should include:
+
+```text
+[GDT ] Ring 3 code/data descriptors PASS.
+[IDT ] int 0x80 DPL3 gate PASS.
+[R3  ] Starting Ring 3 user-program test...
+[USER] Hello from HisperiaOS Ring 3!
+[R3  ] User program exited: 0
+[R3  ] CPL3 execution + syscall + exit round-trip PASS.
+```
+
+`make validate` compiles the normal kernel and both existing deliberate memory-protection fault-test configurations. The actual CPL3 transition must still be runtime-tested on the target machine or in QEMU; a successful compile alone does not prove that `iretq`, TSS stack switching, and the syscall return path execute correctly.
 
 ## Validation status of this source package
 
