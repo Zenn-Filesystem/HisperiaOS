@@ -7,7 +7,6 @@ A freestanding x86-64 kernel in C and x86-64 assembly, booted with Limine (base 
 - Limine boot handoff, framebuffer output, COM1 serial diagnostics
 - GDT, TSS, IDT, IST1, and CPU exception reporting
 - Bitmap PMM with 4 KiB frames, allocation/free validation, and HHDM access
-- Dedicated supervisor MMIO virtual window with PCD+PWT mappings for PCI device registers
 - Four-level x86-64 page-table inspection and mapping walker
 - 1 GiB / 2 MiB huge-page splitting when a 4 KiB permission change is needed
 - CR0.WP + EFER.NXE activation
@@ -150,3 +149,8 @@ remain future work. See `STORAGE-README.md` for details and expected serial logs
 ## AHCI SATA (experimental)
 
 See `AHCI-README.md`. Build with `make validate`; test the AHCI path with `make run-sata` on a host with QEMU, xorriso, and dosfstools installed. The initial AHCI backend is polling and read-only; physical hardware support is not yet verified.
+
+
+## ext4 + VFS
+
+See [EXT4-VFS-README.md](EXT4-VFS-README.md) for the initial read-only ext4 backend, VFS API, supported on-disk profile, limitations, and host tests.

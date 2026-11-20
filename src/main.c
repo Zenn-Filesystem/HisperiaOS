@@ -12,6 +12,8 @@
 #include "blockdev.h"
 #include "partition.h"
 #include "fat32.h"
+#include "ext4.h"
+#include "vfs.h"
 #include "ata_pio.h"
 #include "ahci.h"
 
@@ -1252,6 +1254,35 @@ void kmain(void) {
             }
             if (!sata_fat_mounted)
                 console_print("[FAT ] No valid FAT32 volume found on AHCI disk.\n");
+
+            /* Try native Linux ext4 partitions through the VFS read-only backend. */
+            static struct ext4_fs ext4_root; /* static: VFS keeps a pointer to it */
+            int ext4_mounted = 0;
+            for (size_t i = 0; i < sata_part_count; i++) {
+                if (vfs_mount_ext4(&ext4_root, &sata_disk, &sata_parts[i])) {
+                    console_print("[EXT4] Mounted read-only through VFS | block size: ");
+                    console_print_u64(ext4_root.block_size);
+                    console_print(" | groups: ");
+                    console_print_u64(ext4_root.groups_count);
+                    console_print("\n");
+                    ext4_mounted = 1;
+                    break;
+                }
+            }
+            if (ext4_mounted) {
+                uint32_t cursor = 0;
+                struct vfs_dirent entry;
+                unsigned shown = 0;
+                console_print("[VFS ] Root directory entries: ");
+                while (shown < 8 && vfs_readdir("/", &cursor, &entry) == 1) {
+                    console_print(entry.name);
+                    console_print(" ");
+                    shown++;
+                }
+                console_print("\n");
+            } else {
+                console_print("[EXT4] No supported ext4 partition found.\n");
+            }
         }
     } else {
         console_print("[AHCI] Initialization failed: ");

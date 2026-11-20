@@ -24,6 +24,7 @@ C_SRC := \
     src/blockdev.c \
     src/partition.c \
     src/fat32.c \
+    src/ext4.c \
     src/ata_pio.c \
     src/pci.c \
     src/ahci.c
@@ -91,7 +92,7 @@ LDFLAGS := \
 # DEFAULT
 # =========================================
 
-.PHONY: all kernel iso run fat32-disk run-fat32 qemu-fat32 run-sata qemu-sata test-storage-host clean help validate
+.PHONY: all kernel iso run fat32-disk run-fat32 qemu-fat32 run-sata qemu-sata test-storage-host test-ext4-host clean help validate
 
 all: kernel
 
@@ -290,9 +291,23 @@ help:
 	@echo "make run-fat32 - Boot with a FAT32 disk on legacy IDE PIO"
 	@echo "make qemu-fat32 - Alias for run-fat32"
 	@echo "make test-storage-host - Run host-side block/partition/FAT32 tests"
+	@echo "make test-ext4-host - Run synthetic ext4 + VFS host test"
 	@echo "make RUN_EXCEPTION_TEST=1 - Enable deliberate exception test"
 	@echo "make RUN_MPROTECT_TEST=1 - Test RO write protection (expected #PF)"
 	@echo "make RUN_MPROTECT_TEST=2 - Test NX execution protection (expected #PF)"
 	@echo "make validate - Compile normal + both fault-test configurations"
 	@echo "Ring 3 demo runs automatically during normal boot"
 	@echo "make clean  - Clean build files"
+
+# Read-only ext4 + VFS host integration test.
+HOST_EXT4_TEST := $(BUILD_DIR)/ext4-host-test
+
+.PHONY: test-ext4-host
+
+test-ext4-host: $(HOST_EXT4_TEST)
+	$(HOST_EXT4_TEST)
+
+$(HOST_EXT4_TEST): tools/ext4_host_test.c src/blockdev.c src/ext4.c src/heap.c src/pmm.c src/vmm.c | $(BUILD_DIR)
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
+	    tools/ext4_host_test.c src/blockdev.c src/ext4.c \
+	    -o $@
