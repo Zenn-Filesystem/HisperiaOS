@@ -20,14 +20,19 @@ C_SRC := \
     src/vmm.c \
     src/stack.c \
     src/heap.c \
+    src/vfs.c \
     src/ring3.c \
     src/blockdev.c \
-    src/partition.c \
-    src/fat32.c \
-    src/ext4.c \
-    src/ata_pio.c \
-    src/pci.c \
-    src/ahci.c
+    drivers/bus/pci.c \
+    drivers/storage/ata_pio.c \
+    drivers/storage/ahci.c \
+    drivers/firmware/acpi_power.c \
+    drivers/input/ps2_keyboard.c \
+    lib/storage/partition.c \
+    lib/fs/fat32.c \
+    lib/fs/ext4.c \
+    lib/input/keyboard.c \
+    lib/input/keymap_us.c
 
 ASM_SRC := \
     src/gdt_load.S \
@@ -35,8 +40,8 @@ ASM_SRC := \
     src/ring3.S \
     src/user_program.S
 
-C_OBJ := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(C_SRC))
-ASM_OBJ := $(patsubst src/%.S,$(BUILD_DIR)/%.asm.o,$(ASM_SRC))
+C_OBJ := $(addprefix $(BUILD_DIR)/,$(C_SRC:.c=.o))
+ASM_OBJ := $(addprefix $(BUILD_DIR)/,$(ASM_SRC:.S=.asm.o))
 OBJ := $(C_OBJ) $(ASM_OBJ)
 
 KERNEL := $(BUILD_DIR)/kernel.elf
@@ -92,7 +97,7 @@ LDFLAGS := \
 # DEFAULT
 # =========================================
 
-.PHONY: all kernel iso run fat32-disk run-fat32 qemu-fat32 run-sata qemu-sata test-storage-host test-ext4-host clean help validate
+.PHONY: all kernel iso run fat32-disk run-fat32 qemu-fat32 run-sata qemu-sata test-storage-host test-vfs-host test-ext4-host clean help validate
 
 all: kernel
 
@@ -107,10 +112,12 @@ $(BUILD_DIR):
 # COMPILE
 # =========================================
 
-$(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.asm.o: src/%.S | $(BUILD_DIR)
+$(BUILD_DIR)/%.asm.o: %.S | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Header dependency tracking: ubah include/*.h -> objek terkait dibangun ulang.
@@ -260,10 +267,34 @@ HOST_STORAGE_TEST := $(BUILD_DIR)/storage-host-test
 test-storage-host: $(HOST_STORAGE_TEST)
 	$(HOST_STORAGE_TEST)
 
-$(HOST_STORAGE_TEST): tools/storage_host_test.c src/blockdev.c src/partition.c src/fat32.c | $(BUILD_DIR)
+$(HOST_STORAGE_TEST): tools/storage_host_test.c src/blockdev.c lib/storage/partition.c lib/fs/fat32.c | $(BUILD_DIR)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
-	    tools/storage_host_test.c src/blockdev.c src/partition.c src/fat32.c \
+	    tools/storage_host_test.c src/blockdev.c lib/storage/partition.c lib/fs/fat32.c \
 	    -o $@
+
+# Generic VFS dispatch tests using a small in-memory mock filesystem.
+HOST_VFS_TEST := $(BUILD_DIR)/vfs-host-test
+
+.PHONY: test-vfs-host
+
+test-vfs-host: $(HOST_VFS_TEST)
+	$(HOST_VFS_TEST)
+
+$(HOST_VFS_TEST): tools/vfs_host_test.c src/vfs.c include/vfs.h | $(BUILD_DIR)
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
+	    tools/vfs_host_test.c src/vfs.c -o $@
+
+# Device-neutral keyboard queue and US keymap host tests.
+HOST_KEYBOARD_TEST := $(BUILD_DIR)/keyboard-host-test
+
+.PHONY: test-keyboard-host
+
+test-keyboard-host: $(HOST_KEYBOARD_TEST)
+	$(HOST_KEYBOARD_TEST)
+
+$(HOST_KEYBOARD_TEST): tools/keyboard_host_test.c lib/input/keyboard.c lib/input/keymap_us.c | $(BUILD_DIR)
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
+	    tools/keyboard_host_test.c lib/input/keyboard.c lib/input/keymap_us.c -o $@
 
 # =========================================
 # CLEAN
@@ -291,7 +322,9 @@ help:
 	@echo "make run-fat32 - Boot with a FAT32 disk on legacy IDE PIO"
 	@echo "make qemu-fat32 - Alias for run-fat32"
 	@echo "make test-storage-host - Run host-side block/partition/FAT32 tests"
+	@echo "make test-vfs-host - Run generic VFS dispatch tests"
 	@echo "make test-ext4-host - Run synthetic ext4 + VFS host test"
+	@echo "make test-keyboard-host - Run device-neutral keyboard queue/keymap tests"
 	@echo "make RUN_EXCEPTION_TEST=1 - Enable deliberate exception test"
 	@echo "make RUN_MPROTECT_TEST=1 - Test RO write protection (expected #PF)"
 	@echo "make RUN_MPROTECT_TEST=2 - Test NX execution protection (expected #PF)"
@@ -307,7 +340,7 @@ HOST_EXT4_TEST := $(BUILD_DIR)/ext4-host-test
 test-ext4-host: $(HOST_EXT4_TEST)
 	$(HOST_EXT4_TEST)
 
-$(HOST_EXT4_TEST): tools/ext4_host_test.c src/blockdev.c src/ext4.c src/heap.c src/pmm.c src/vmm.c | $(BUILD_DIR)
+$(HOST_EXT4_TEST): tools/ext4_host_test.c src/blockdev.c lib/fs/ext4.c src/vfs.c src/heap.c src/pmm.c src/vmm.c | $(BUILD_DIR)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Iinclude \
-	    tools/ext4_host_test.c src/blockdev.c src/ext4.c \
+	    tools/ext4_host_test.c src/blockdev.c lib/fs/ext4.c src/vfs.c \
 	    -o $@

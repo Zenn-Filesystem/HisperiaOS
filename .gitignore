@@ -1,9 +1,11 @@
+# Build output
 /build/
 *.o
 *.d
 *.elf
 *.iso
 *.img
-*.log
+
+# Generated archives and logs
 *.zip
-__pycache__/
+*.log

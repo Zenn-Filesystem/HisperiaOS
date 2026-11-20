@@ -16,6 +16,9 @@
 #include "vfs.h"
 #include "ata_pio.h"
 #include "ahci.h"
+#include "acpi.h"
+#include "drivers/input/ps2_keyboard.h"
+#include "input/keyboard.h"
 
 #ifndef HISPERIA_RUN_EXCEPTION_TEST
 #define HISPERIA_RUN_EXCEPTION_TEST 0
@@ -95,6 +98,12 @@ static volatile struct limine_memmap_request memmap_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST_ID,
     .revision = 0
 };
 
@@ -250,6 +259,9 @@ static void clear_screen(uint32_t color) {
             put_pixel(x, y, color);
         }
     }
+
+    cursor_x = 8;
+    cursor_y = 8;
 }
 
 /* =========================================
@@ -415,6 +427,14 @@ static void screen_newline(void) {
 static void screen_putchar(char c) {
     if (!fb_ready || c == '\r')
         return;
+
+    if (c == '\b') {
+        if (cursor_x > 8) {
+            cursor_x -= CHAR_WIDTH;
+            draw_char(' ', cursor_x, cursor_y);
+        }
+        return;
+    }
 
     if (c == '\n') {
         screen_newline();
@@ -840,6 +860,162 @@ cleanup:
 }
 
 /* =========================================
+ * CROSS-TRANSPORT STORAGE DISCOVERY
+ *
+ * AHCI and ATA PIO expose the same block_device interface. Everything above
+ * this point (partition parsing, filesystem probing, VFS) is transport-agnostic.
+ * Keep the device and ext4 objects static because VFS retains their addresses.
+ * ========================================= */
+static int storage_scan_device(struct block_device *device,
+                               struct ext4_fs *ext4_root)
+{
+    struct partition_entry partitions[16];
+    size_t partition_count = 0;
+
+    if (!device || !ext4_root)
+        return 0;
+
+    console_print("[PART] Scanning ");
+    console_print(device->name);
+    console_print(" for MBR/GPT partitions...\n");
+
+    if (!partition_scan(device, partitions, 16, &partition_count)) {
+        console_print("[PART] Partition table invalid or unreadable on ");
+        console_print(device->name);
+        console_print(".\n");
+        return 0;
+    }
+
+    console_print("[PART] ");
+    console_print(device->name);
+    console_print(" partitions: ");
+    console_print_u64(partition_count);
+    console_print("\n");
+
+    /* FAT32 currently has BPB validation/mount metadata, not VFS file ops. */
+    int fat32_found = 0;
+    for (size_t i = 0; i < partition_count; i++) {
+        struct fat32_fs fat32 = {0};
+        if (fat32_mount(&fat32, device, &partitions[i])) {
+            console_print("[FAT ] FAT32 volume detected on ");
+            console_print(device->name);
+            console_print(": ");
+            console_print(fat32.volume_label);
+            console_print(" | clusters: ");
+            console_print_u64(fat32.cluster_count);
+            console_print("\n");
+            fat32_found = 1;
+            break;
+        }
+    }
+    if (!fat32_found)
+        console_print("[FAT ] No FAT32 volume on this device.\n");
+
+    /* Try ext4 on every partition until the generic VFS root is mounted. */
+    if (!vfs_is_mounted()) {
+        for (size_t i = 0; i < partition_count; i++) {
+            console_print("[EXT4] Probing partition #");
+            console_print_u64(i);
+            console_print(" | start LBA: ");
+            console_print_u64(partitions[i].first_lba);
+            console_print(" | sectors: ");
+            console_print_u64(partitions[i].sector_count);
+            console_print(" | MBR type: ");
+            console_print_hex(partitions[i].mbr_type);
+            console_print("\n");
+
+            if (vfs_mount_ext4(ext4_root, device, &partitions[i])) {
+                console_print("[EXT4] Mounted read-only from ");
+                console_print(device->name);
+                console_print(" through generic VFS | block size: ");
+                console_print_u64(ext4_root->block_size);
+                console_print(" | groups: ");
+                console_print_u64(ext4_root->groups_count);
+                console_print("\n");
+                return 1;
+            }
+
+            console_print("[EXT4] Partition #");
+            console_print_u64(i);
+            console_print(" rejected: ");
+            console_print(ext4_last_error());
+            console_print(" | magic: ");
+            console_print_hex(ext4_last_magic());
+            console_print(" | incompat: ");
+            console_print_hex(ext4_last_incompat_features());
+            console_print(" | ro_compat: ");
+            console_print_hex(ext4_last_ro_compat_features());
+            console_print("\n");
+        }
+    }
+
+    if (!vfs_is_mounted())
+        console_print("[EXT4] No supported ext4 partition on this device.\n");
+    return vfs_is_mounted();
+}
+
+static void storage_probe_and_mount(void)
+{
+    /* Static lifetime is required: ext4/VFS retain pointers after this call. */
+    static struct block_device ahci_device;
+    static struct block_device ata_device;
+    static struct ext4_fs ext4_root;
+
+    console_print("[STOR] Cross-transport storage discovery starting.\n");
+
+    /* Prefer AHCI when present (native laptop SATA and QEMU q35). */
+    console_print("[AHCI] Probing PCI AHCI controller...\n");
+    if (ahci_init(&ahci_device)) {
+        console_print("[AHCI] Block device: ");
+        console_print(ahci_device.name);
+        console_print(" | sectors: ");
+        console_print_u64(ahci_device.sector_count);
+        console_print(" | read-only DMA.\n");
+        (void)storage_scan_device(&ahci_device, &ext4_root);
+    } else {
+        console_print("[AHCI] Not available: ");
+        console_print(ahci_last_error());
+        console_print("\n");
+    }
+
+    /* Fall back to legacy ATA PIO when no ext4 root was mounted via AHCI. */
+    if (!vfs_is_mounted()) {
+        console_print("[ATA ] Probing primary-master IDE device...\n");
+        if (ata_pio_init_primary_master(&ata_device)) {
+            console_print("[ATA ] Block device: ");
+            console_print(ata_device.name);
+            console_print(" | sectors: ");
+            console_print_u64(ata_device.sector_count);
+            console_print(" | LBA28 PIO read-only.\n");
+            (void)storage_scan_device(&ata_device, &ext4_root);
+        } else {
+            console_print("[ATA ] No primary-master IDE device detected.\n");
+        }
+    }
+
+    if (vfs_is_mounted()) {
+        uint64_t root_size = 0;
+        uint8_t root_type = VFS_TYPE_UNKNOWN;
+        (void)vfs_stat("/", &root_size, &root_type);
+        console_print("[VFS ] Root filesystem ready; Ring 3 file syscalls enabled.\n");
+
+        uint32_t cursor = 0;
+        struct vfs_dirent entry;
+        unsigned shown = 0;
+        console_print("[VFS ] Root directory entries: ");
+        while (shown < 8 && vfs_readdir("/", &cursor, &entry) == 1) {
+            console_print(entry.name);
+            console_print(" ");
+            shown++;
+        }
+        console_print("\n");
+    } else {
+        console_print("[VFS ] No supported ext4 root found; Ring 3 filesystem probes will report unavailable.\n");
+    }
+
+}
+
+/* =========================================
  * KERNEL ENTRY
  * ========================================= */
 
@@ -1184,111 +1360,7 @@ void kmain(void) {
     }
     console_print("[FAT ] FAT32 BPB geometry validation PASS.\n");
 
-    console_print("[ATA ] Probing QEMU primary-master IDE device...\n");
-    struct block_device ata_disk = {0};
-    if (ata_pio_init_primary_master(&ata_disk)) {
-        console_print("[ATA ] Device: ");
-        console_print(ata_disk.name);
-        console_print(" | sectors: ");
-        console_print_u64(ata_disk.sector_count);
-        console_print(" | LBA28 PIO read-only.\n");
-
-        struct partition_entry partitions[16];
-        size_t partition_count = 0;
-        if (!partition_scan(&ata_disk, partitions, 16, &partition_count)) {
-            console_print("[PART] Disk partition table invalid or unreadable.\n");
-        } else {
-            console_print("[PART] Detected partitions: ");
-            console_print_u64(partition_count);
-            console_print("\n");
-
-            int fat_mounted = 0;
-            for (size_t i = 0; i < partition_count; i++) {
-                struct fat32_fs filesystem = {0};
-                if (fat32_mount(&filesystem, &ata_disk, &partitions[i])) {
-                    console_print("[FAT ] FAT32 mounted read-only: ");
-                    console_print(filesystem.volume_label);
-                    console_print(" | clusters: ");
-                    console_print_u64(filesystem.cluster_count);
-                    console_print(" | root cluster: ");
-                    console_print_u64(filesystem.root_cluster);
-                    console_print("\n");
-                    fat_mounted = 1;
-                    break;
-                }
-            }
-            if (!fat_mounted)
-                console_print("[FAT ] No valid FAT32 volume found on IDE disk.\n");
-        }
-    } else {
-        console_print("[ATA ] No primary-master IDE disk detected; QEMU FAT32 test skipped.\n");
-    }
-
-    /* AHCI SATA backend: independent of legacy IDE PIO. */
-    console_print("[AHCI] Scanning PCI for AHCI controller...\n");
-    struct block_device sata_disk = {0};
-    if (ahci_init(&sata_disk)) {
-        console_print("[AHCI] Device: ");
-        console_print(sata_disk.name);
-        console_print(" | sectors: ");
-        console_print_u64(sata_disk.sector_count);
-        console_print(" | SATA READ DMA EXT, polling, read-only.\n");
-        struct partition_entry sata_parts[16];
-        size_t sata_part_count = 0;
-        if (!partition_scan(&sata_disk, sata_parts, 16, &sata_part_count)) {
-            console_print("[PART] AHCI partition table invalid or unreadable.\n");
-        } else {
-            console_print("[PART] AHCI partitions detected: ");
-            console_print_u64(sata_part_count);
-            console_print("\n");
-            int sata_fat_mounted = 0;
-            for (size_t i = 0; i < sata_part_count; i++) {
-                struct fat32_fs sata_fs = {0};
-                if (fat32_mount(&sata_fs, &sata_disk, &sata_parts[i])) {
-                    console_print("[FAT ] AHCI FAT32 mounted read-only: ");
-                    console_print(sata_fs.volume_label);
-                    console_print("\n");
-                    sata_fat_mounted = 1;
-                    break;
-                }
-            }
-            if (!sata_fat_mounted)
-                console_print("[FAT ] No valid FAT32 volume found on AHCI disk.\n");
-
-            /* Try native Linux ext4 partitions through the VFS read-only backend. */
-            static struct ext4_fs ext4_root; /* static: VFS keeps a pointer to it */
-            int ext4_mounted = 0;
-            for (size_t i = 0; i < sata_part_count; i++) {
-                if (vfs_mount_ext4(&ext4_root, &sata_disk, &sata_parts[i])) {
-                    console_print("[EXT4] Mounted read-only through VFS | block size: ");
-                    console_print_u64(ext4_root.block_size);
-                    console_print(" | groups: ");
-                    console_print_u64(ext4_root.groups_count);
-                    console_print("\n");
-                    ext4_mounted = 1;
-                    break;
-                }
-            }
-            if (ext4_mounted) {
-                uint32_t cursor = 0;
-                struct vfs_dirent entry;
-                unsigned shown = 0;
-                console_print("[VFS ] Root directory entries: ");
-                while (shown < 8 && vfs_readdir("/", &cursor, &entry) == 1) {
-                    console_print(entry.name);
-                    console_print(" ");
-                    shown++;
-                }
-                console_print("\n");
-            } else {
-                console_print("[EXT4] No supported ext4 partition found.\n");
-            }
-        }
-    } else {
-        console_print("[AHCI] Initialization failed: ");
-        console_print(ahci_last_error());
-        console_print("\n");
-    }
+    storage_probe_and_mount();
 
     /* Execute a real user payload at CPL3, service int 0x80, and return. */
     console_print("[R3  ] Starting Ring 3 user-program test...\n");
@@ -1299,8 +1371,26 @@ void kmain(void) {
     console_print("[R3  ] CPL3 execution + syscall + exit round-trip PASS.\n");
 
     console_print("[INFO] Kernel initialization complete.\n");
-    console_print("\n");
+    clear_screen(COLOR_BLACK);
     console_print("Welcome to HisperiaOS!\n");
+
+    if (rsdp_request.response && rsdp_request.response->address && hhdm_request.response) {
+        uint64_t rsdp_addr = (uint64_t)(uintptr_t)rsdp_request.response->address;
+        uint64_t hhdm = hhdm_request.response->offset;
+        /* Limine may expose the RSDP as a physical address or HHDM pointer. */
+        uint64_t rsdp_phys = (rsdp_addr >= hhdm) ? (rsdp_addr - hhdm) : rsdp_addr;
+        if (acpi_power_init(rsdp_phys, hhdm))
+            console_print("[ACPI] Power button event + S5 soft-off ready (polling).\n");
+        else
+            console_print("[ACPI] Power button unavailable: ACPI fixed-event setup failed.\n");
+    } else {
+        console_print("[ACPI] RSDP unavailable; power button support disabled.\n");
+    }
+
+    if (ps2_keyboard_init())
+        console_print("[KBD ] PS/2 keyboard ready (Set-1 translated, polling).\n");
+    else
+        console_print("[KBD ] PS/2 keyboard unavailable.\n");
 
 #if HISPERIA_RUN_EXCEPTION_TEST
     console_print("[TEST] Triggering exception test...\n");
@@ -1308,5 +1398,20 @@ void kmain(void) {
     console_print("[ERROR] Test unexpectedly returned!\n");
 #endif
 
-    halt_cpu();
+    console_print("[INPUT] Type on the keyboard; power button requests ACPI S5.\n");
+    /* Early input loop: PS/2 and ACPI fixed events are polled until IRQ routing exists. */
+    for (;;) {
+        ps2_keyboard_poll();
+
+        struct key_event event;
+        while (keyboard_event_pop(&event)) {
+            if (event.pressed && event.ascii)
+                console_putchar((char)event.ascii);
+        }
+
+        if (acpi_power_available())
+            (void)acpi_power_button_poll();
+
+        __asm__ volatile("pause");
+    }
 }

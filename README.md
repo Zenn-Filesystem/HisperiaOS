@@ -18,8 +18,57 @@ A freestanding x86-64 kernel in C and x86-64 assembly, booted with Limine (base 
 - Independent user address-space roots, private lower-half mappings, shared supervisor-only upper-half mappings, CR3 activation, query, unmap, and destroy APIs
 - Ring 3 GDT descriptors (DPL 3), TSS.RSP0 kernel-entry stack, and a DPL 3 `int 0x80` gate
 - First CPL3 payload copied into a user RX page, with a separate user RW/NX stack
-- Minimal syscall ABI: `write` (1) and `exit` (2), including bounded user-pointer validation/copy via the HHDM
+- Generic VFS dispatcher with an ext4 read-only backend; filesystem-specific inode/path logic is kept outside the VFS core
+- Cross-transport storage discovery: AHCI first, then legacy ATA PIO fallback; both feed the same block-device, MBR/GPT, ext4, and VFS path
+- Read-only filesystem syscall ABI: `write`, `exit`, `open`, `read`, `close`, `seek`, `stat`, and `readdir` (IDs 1–8), with bounded user-pointer validation/copy via the HHDM
 - Ring 3 exit trampoline that restores the kernel CR3, destroys the temporary address space, and resumes the suspended kernel caller
+
+## Source layout
+
+```text
+src/                    Kernel core and orchestration
+  main.c                Boot flow and early console/input loop
+  vfs.c, blockdev.c     Device-neutral kernel services
+  gdt.c, idt.c, ...     CPU, memory, and process primitives
+
+drivers/                Hardware-facing implementations
+  bus/                  PCI enumeration
+  firmware/             ACPI power management
+  input/                PS/2 keyboard transport
+  storage/              ATA PIO and AHCI controllers
+
+lib/                    Device-neutral reusable code
+  fs/                   FAT32 and ext4 filesystem implementations
+  input/                Keyboard event queue and US keymap
+  storage/              MBR/GPT partition parsing
+
+include/                Public interfaces shared across subsystems
+tools/                  Host-side validation programs
+```
+
+The keyboard path is intentionally split: `drivers/input/ps2_keyboard.c`
+reads the i8042 controller and translates Set-1 scan codes into HID-style
+keycodes; `lib/input/keyboard.c` provides a device-neutral event queue; and
+`lib/input/keymap_us.c` converts keycodes plus modifiers to ASCII. Other
+keyboard transports can feed the same event queue without changing the
+keymap or console.
+
+## Minimal keyboard support
+
+The current early driver supports the first i8042/PS/2 keyboard port, enables
+controller Set-2-to-Set-1 translation, and polls the output buffer. It handles
+basic alphanumeric keys, punctuation, Enter, Backspace, Tab, modifiers,
+Caps Lock, and common extended navigation keys. Pressed printable keys are
+echoed to the framebuffer and serial console.
+
+This is an early polling implementation: it does not yet use IRQ1, PIC/APIC
+routing, USB HID, mouse input, layouts other than US, or a terminal line editor.
+The ACPI power-button fixed event remains polled from the same idle loop.
+
+Validation includes host tests for keymap behavior, event queue ordering,
+and overflow handling. Hardware/QEMU keyboard operation still needs runtime
+verification on the target machine. See `KEYBOARD-DRIVER.md` for the driver
+contract, supported keys, and current limitations.
 
 ## Memory-protection policy
 
@@ -82,11 +131,11 @@ Normal startup runs:
 
 ## Ring 3 first-program milestone
 
-Normal boot now runs a tiny position-independent assembly payload at CPL3. It issues `int 0x80` with `write(1, user_buffer, length)`, checks the returned byte count, and then calls `exit(2, status)`. The syscall handler validates the caller privilege and user mappings, copies user data through the supervisor HHDM alias, and writes it to the kernel console. `SYS_EXIT` rewrites the interrupt return frame to a Ring 0 trampoline; the trampoline restores the kernel CR3, destroys the temporary address space, and returns to the suspended kernel call site.
+Normal boot now runs a tiny position-independent assembly payload at CPL3. It exercises `write`, `stat`, `readdir`, `open`, `seek`, `read`, `close`, and `exit` through `int 0x80`. Filesystem calls are dispatched through the generic VFS; the current mounted ext4 root is read-only. The syscall handler validates the caller privilege and user mappings, copies data through the supervisor HHDM alias, and never dereferences a user pointer directly. The syscall numbers and fixed `stat` / `dirent` layouts are declared in `include/syscall.h`. `SYS_EXIT` rewrites the interrupt return frame to a Ring 0 trampoline; the trampoline restores the kernel CR3, destroys the temporary address space, and returns to the suspended kernel call site.
 
 Selectors are kept stable for the existing kernel/TSS setup: kernel code `0x08`, kernel data `0x10`, TSS `0x18`, user data `0x2B`, and user code `0x33`. The syscall interrupt gate is vector `0x80`, selector `0x08`, type attributes `0xEE` (present, DPL 3, 64-bit interrupt gate).
 
-The demonstration is intentionally a single synchronous task. It is a real CPU CPL3 transition, but it is not yet an application environment: the payload is a built-in assembly blob rather than an ELF file, and the syscall ABI is deliberately tiny. User IF remains cleared because hardware IRQ handlers are not installed yet; software `int 0x80` works independently of IF.
+The demonstration is intentionally a single synchronous task. It is a real CPU CPL3 transition, but it is not yet an application environment: the payload is a built-in assembly blob rather than an ELF file, and the syscall ABI is deliberately small and read-only. `open` currently accepts regular files; `readdir` uses an absolute path and a 32-bit byte-offset cursor rather than a directory file descriptor. The 16-entry descriptor table is currently part of the Ring 3 test harness, not a per-process resource table. User IF remains cleared because hardware IRQ handlers are not installed yet; software `int 0x80` works independently of IF.
 
 ## Address-space scope and limitations
 
@@ -113,11 +162,12 @@ After building and booting the normal kernel, the serial output should include:
 [IDT ] int 0x80 DPL3 gate PASS.
 [R3  ] Starting Ring 3 user-program test...
 [USER] Hello from HisperiaOS Ring 3!
+[USER] stat + readdir syscalls PASS
 [R3  ] User program exited: 0
 [R3  ] CPL3 execution + syscall + exit round-trip PASS.
 ```
 
-`make validate` compiles the normal kernel and both existing deliberate memory-protection fault-test configurations. The actual CPL3 transition must still be runtime-tested on the target machine or in QEMU; a successful compile alone does not prove that `iretq`, TSS stack switching, and the syscall return path execute correctly.
+`make validate` runs host tests for block/partition/FAT32 validation, generic VFS dispatch, and synthetic ext4 + VFS integration, then compiles the normal kernel and both deliberate memory-protection fault-test configurations. The actual CPL3 file-syscall path must still be runtime-tested on the target machine or in QEMU; a successful compile alone does not prove that `iretq`, TSS stack switching, AHCI I/O under the user CR3, or the syscall return path execute correctly.
 
 ## Validation status of this source package
 
@@ -125,7 +175,8 @@ After building and booting the normal kernel, the serial output should include:
 - `RUN_MPROTECT_TEST=1`: compile and link verified.
 - `RUN_MPROTECT_TEST=2`: compile and link verified.
 - ELF program headers checked: separate R, R-X, R, and RW load segments; no RWX load segment.
-- QEMU / physical-hardware runtime: **not verified in the packaging environment**. `qemu-system-x86_64` and `xorriso` were not installed there. Boot and inspect the serial log on the target machine before treating the new runtime self-tests as passed.
+- AHCI physical-hardware runtime: the maintainer reports successful SATA detection and partition enumeration on the target laptop.
+- New Ring 3 filesystem syscalls: **not runtime-verified in the packaging environment**. `qemu-system-x86_64` and `xorriso` were not installed there. Boot on the target machine and inspect the serial log before treating the `stat` / `readdir` / file-read syscall path as passed.
 
 ## Repository hygiene
 
@@ -134,23 +185,26 @@ Generated build output, ELF / ISO files, object and dependency files, logs, and 
 
 ## Storage foundation (Block Device / MBR-GPT / FAT32)
 
-The first read-only storage stack is in place. `blockdev` provides a 512-byte
-sector interface, a writable RAM-disk backend is used by kernel self-tests,
-`partition` parses primary MBR and GPT (including CRC32 checks), and `fat32`
-validates FAT32 BPB geometry and mounts a volume read-only. A polling primary-
-master ATA PIO driver is included for the first QEMU disk test.
+The storage stack provides a 512-byte `block_device` interface, a RAM-disk
+backend for kernel tests, MBR/GPT parsing (including GPT CRC32 checks), and
+FAT32 BPB/geometry detection. Both legacy ATA PIO and AHCI register as block-device
+backends. At boot the kernel probes AHCI first, then tries ATA PIO if no ext4 root
+was mounted; partition scanning and ext4/VFS mounting are shared across both
+transports.
 
-Run the host-side parser tests with `make test-storage-host`. To create a
-128 MiB MBR/FAT32 image and boot it as a legacy IDE disk in QEMU, use
-`make run-fat32`. This test uses `-M pc` intentionally because AHCI/NVMe are not
-implemented. FAT directory traversal, file reads/writes, VFS, and GBA ROM loading
-remain future work. See `STORAGE-README.md` for details and expected serial logs.
+Run the host-side parser tests with `make test-storage-host`. To exercise the
+legacy IDE / ATA PIO path in QEMU, use `make run-fat32`; to exercise AHCI, use
+`make run-sata`. The generated QEMU fixture is FAT32, which is currently detected
+but is not yet registered as a generic VFS backend. Ring 3 file syscalls therefore
+require an ext4 partition to be mounted. FAT32 VFS operations, NVMe, USB mass
+storage, and GBA ROM loading remain future work. See `CROSS-LOAD.md` for the
+cross-transport boot flow.
 
 ## AHCI SATA (experimental)
 
-See `AHCI-README.md`. Build with `make validate`; test the AHCI path with `make run-sata` on a host with QEMU, xorriso, and dosfstools installed. The initial AHCI backend is polling and read-only; physical hardware support is not yet verified.
+See `AHCI-README.md`. Build with `make validate`; test the AHCI path with `make run-sata` on a host with QEMU and xorriso installed. The driver is polling and read-only. The maintainer reports that it detects the SATA device and enumerates its partitions on the target laptop; this does not imply support for every AHCI controller.
 
 
 ## ext4 + VFS
 
-See [EXT4-VFS-README.md](EXT4-VFS-README.md) for the initial read-only ext4 backend, VFS API, supported on-disk profile, limitations, and host tests.
+See [EXT4-VFS-README.md](EXT4-VFS-README.md) for the read-only ext4 backend and VFS API. The metadata checksum / `CSUM_SEED` implementation and its exact support limits are documented in [EXT4-READONLY-V0.2.md](EXT4-READONLY-V0.2.md).

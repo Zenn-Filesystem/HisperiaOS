@@ -17,12 +17,19 @@ struct ext4_fs {
     uint16_t descriptor_size;
     uint32_t feature_incompat;
     uint32_t feature_ro_compat;
+    uint32_t checksum_seed;
+    uint32_t creator_os;
     uint32_t groups_count;
+    uint8_t metadata_csum;
     uint8_t mounted;
 };
 
 int ext4_mount(struct ext4_fs *fs, struct block_device *device,
                const struct partition_entry *partition);
+const char *ext4_last_error(void);
+uint16_t ext4_last_magic(void);
+uint32_t ext4_last_incompat_features(void);
+uint32_t ext4_last_ro_compat_features(void);
 int ext4_self_test(void);
 
 #endif

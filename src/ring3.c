@@ -6,16 +6,18 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "ring3.h"
+#include "vfs.h"
+#include "syscall.h"
 
 #define USER_CODE_BASE       0x0000000000400000ULL
 #define USER_STACK_BASE      0x00000000007FF000ULL
 #define USER_STACK_TOP       (USER_STACK_BASE + VMM_PAGE_SIZE)
 #define USER_TOP             0x0000800000000000ULL
 #define RING3_KERNEL_STACK_SIZE (16ULL * 1024ULL)
-#define USER_WRITE_MAX       256ULL
+#define USER_WRITE_MAX       512ULL
+#define USER_FD_COUNT        16U
+#define USER_FD_BASE         3U
 
-#define SYS_WRITE 1ULL
-#define SYS_EXIT  2ULL
 
 struct ring3_syscall_frame {
     uint64_t r15;
@@ -53,6 +55,16 @@ _Static_assert(offsetof(struct ring3_syscall_frame, rsp) == 144,
                "ring3 frame rsp offset");
 _Static_assert(sizeof(struct ring3_syscall_frame) == 160,
                "ring3 frame size");
+_Static_assert(sizeof(struct hisperia_stat) == 16,
+               "user stat ABI size");
+_Static_assert(sizeof(struct vfs_dirent) == sizeof(struct hisperia_dirent),
+               "VFS/user dirent ABI size");
+_Static_assert(offsetof(struct vfs_dirent, type) ==
+               offsetof(struct hisperia_dirent, type),
+               "VFS/user dirent ABI type offset");
+_Static_assert(offsetof(struct vfs_dirent, name) ==
+               offsetof(struct hisperia_dirent, name),
+               "VFS/user dirent ABI name offset");
 
 extern uint8_t user_blob_start[];
 extern uint8_t user_blob_end[];
@@ -69,6 +81,7 @@ static uint8_t ring3_kernel_stack[RING3_KERNEL_STACK_SIZE]
 static volatile uint64_t exit_status;
 static volatile int exit_seen;
 static volatile int exit_cleanup_ok;
+static struct vfs_file user_files[USER_FD_COUNT];
 
 static void ring3_halt(void)
 {
@@ -99,14 +112,15 @@ static int user_range_readable(uint64_t address, uint64_t length)
 }
 
 /* Copy from user physical pages through the supervisor-only HHDM alias. */
-static int copy_from_user(char *destination,
+static int copy_from_user(void *destination,
                           uint64_t source,
                           uint64_t length)
 {
-    if (!destination || length > USER_WRITE_MAX ||
+    if ((!destination && length != 0) || length > USER_WRITE_MAX ||
         !user_range_readable(source, length))
         return 0;
 
+    uint8_t *destination_bytes = (uint8_t *)destination;
     uint64_t copied = 0;
     while (copied < length) {
         uint64_t current = source + copied;
@@ -129,11 +143,105 @@ static int copy_from_user(char *destination,
         const volatile char *source_bytes =
             (const volatile char *)physical_alias;
         for (uint64_t i = 0; i < chunk; i++)
-            destination[copied + i] = source_bytes[i];
+            destination_bytes[copied + i] = (uint8_t)source_bytes[i];
 
         copied += chunk;
     }
     return 1;
+}
+
+
+static int user_range_writable(uint64_t address, uint64_t length)
+{
+    if (length == 0)
+        return 1;
+    if (address < VMM_PAGE_SIZE || address >= USER_TOP ||
+        length > USER_TOP - address)
+        return 0;
+
+    uint64_t end = address + length;
+    uint64_t page = address & ~(VMM_PAGE_SIZE - 1ULL);
+
+    while (page < end) {
+        struct vmm_mapping_info info;
+        if (!vmm_address_space_query(&current_space, page, &info) ||
+            !info.user || !info.writable)
+            return 0;
+        page += VMM_PAGE_SIZE;
+    }
+    return 1;
+}
+
+static int copy_to_user(uint64_t destination,
+                        const void *source,
+                        uint64_t length)
+{
+    if ((!source && length != 0) || length > USER_WRITE_MAX ||
+        !user_range_writable(destination, length))
+        return 0;
+
+    const uint8_t *source_bytes = (const uint8_t *)source;
+    uint64_t copied = 0;
+    while (copied < length) {
+        uint64_t current = destination + copied;
+        uint64_t page_va = current & ~(VMM_PAGE_SIZE - 1ULL);
+        uint64_t offset = current & (VMM_PAGE_SIZE - 1ULL);
+        uint64_t chunk = VMM_PAGE_SIZE - offset;
+        if (chunk > length - copied)
+            chunk = length - copied;
+
+        struct vmm_mapping_info info;
+        if (!vmm_address_space_query(&current_space, page_va, &info) ||
+            !info.user || !info.writable)
+            return 0;
+
+        void *physical_alias = pmm_phys_to_virt(
+            (info.physical_address & ~(VMM_PAGE_SIZE - 1ULL)) + offset);
+        if (!physical_alias)
+            return 0;
+
+        volatile char *destination_bytes = (volatile char *)physical_alias;
+        for (uint64_t i = 0; i < chunk; i++)
+            destination_bytes[i] = (char)source_bytes[copied + i];
+        copied += chunk;
+    }
+    return 1;
+}
+
+static int copy_user_string(char *destination,
+                            uint64_t source,
+                            size_t capacity)
+{
+    if (!destination || capacity == 0 || capacity > USER_WRITE_MAX)
+        return 0;
+
+    for (size_t i = 0; i < capacity; i++) {
+        char byte;
+        if (!copy_from_user(&byte, source + i, 1))
+            return 0;
+        destination[i] = byte;
+        if (byte == '\0')
+            return i != 0;
+    }
+    return 0;
+}
+
+static struct vfs_file *user_file_from_fd(uint64_t fd)
+{
+    if (fd < USER_FD_BASE || fd >= USER_FD_BASE + USER_FD_COUNT)
+        return 0;
+
+    struct vfs_file *file = &user_files[fd - USER_FD_BASE];
+    return file->opened ? file : 0;
+}
+
+static void user_files_close_all(void)
+{
+    for (size_t i = 0; i < USER_FD_COUNT; i++) {
+        if (user_files[i].opened)
+            vfs_close(&user_files[i]);
+        user_files[i] = (struct vfs_file){0};
+    }
 }
 
 void ring3_syscall_dispatch(struct ring3_syscall_frame *frame)
@@ -148,7 +256,7 @@ void ring3_syscall_dispatch(struct ring3_syscall_frame *frame)
     }
 
     switch (frame->rax) {
-    case SYS_WRITE: {
+    case HISPERIA_SYS_WRITE: {
         char buffer[USER_WRITE_MAX];
         uint64_t length = frame->rsi;
         if (length > USER_WRITE_MAX ||
@@ -162,13 +270,119 @@ void ring3_syscall_dispatch(struct ring3_syscall_frame *frame)
         return;
     }
 
-    case SYS_EXIT: {
+    case HISPERIA_SYS_OPEN: {
+        char path[VFS_PATH_MAX + 1U];
+        if (frame->rsi != 0 ||
+            !copy_user_string(path, frame->rdi, sizeof(path))) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
+        for (size_t i = 0; i < USER_FD_COUNT; i++) {
+            if (!user_files[i].opened && vfs_open(path, &user_files[i])) {
+                frame->rax = USER_FD_BASE + i;
+                return;
+            }
+        }
+        frame->rax = (uint64_t)-1;
+        return;
+    }
+
+    case HISPERIA_SYS_READ: {
+        struct vfs_file *file = user_file_from_fd(frame->rdi);
+        uint64_t destination = frame->rsi;
+        uint64_t length = frame->rdx;
+        char buffer[USER_WRITE_MAX];
+        if (!file || length > USER_WRITE_MAX ||
+            !user_range_writable(destination, length)) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
+        int64_t result = vfs_read(file, buffer, (size_t)length);
+        if (result < 0 ||
+            (result > 0 && !copy_to_user(destination, buffer,
+                                         (uint64_t)result))) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+        frame->rax = (uint64_t)result;
+        return;
+    }
+
+    case HISPERIA_SYS_CLOSE: {
+        struct vfs_file *file = user_file_from_fd(frame->rdi);
+        if (!file) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+        vfs_close(file);
+        frame->rax = 0;
+        return;
+    }
+
+    case HISPERIA_SYS_SEEK: {
+        struct vfs_file *file = user_file_from_fd(frame->rdi);
+        uint64_t new_offset = 0;
+        if (!file || frame->rdx > VFS_SEEK_END ||
+            !vfs_seek(file, (int64_t)frame->rsi,
+                      (int)frame->rdx, &new_offset)) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+        frame->rax = new_offset;
+        return;
+    }
+
+    case HISPERIA_SYS_STAT: {
+        struct hisperia_stat user_stat = {0};
+        char path[VFS_PATH_MAX + 1U];
+
+        if (!copy_user_string(path, frame->rdi, sizeof(path)) ||
+            !vfs_stat(path, &user_stat.size, &user_stat.type) ||
+            !copy_to_user(frame->rsi, &user_stat, sizeof(user_stat))) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
+        frame->rax = 0;
+        return;
+    }
+
+    case HISPERIA_SYS_READDIR: {
+        char path[VFS_PATH_MAX + 1U];
+        uint32_t cursor = 0;
+        struct vfs_dirent entry;
+        volatile uint8_t *entry_bytes = (volatile uint8_t *)&entry;
+        for (size_t i = 0; i < sizeof(entry); i++)
+            entry_bytes[i] = 0;
+
+        if (!copy_user_string(path, frame->rdi, sizeof(path)) ||
+            !user_range_writable(frame->rsi, sizeof(cursor)) ||
+            !user_range_writable(frame->rdx, sizeof(entry)) ||
+            !copy_from_user(&cursor, frame->rsi, sizeof(cursor))) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
+        int result = vfs_readdir(path, &cursor, &entry);
+        if (result < 0 ||
+            (result == 1 && !copy_to_user(frame->rdx, &entry,
+                                          sizeof(entry))) ||
+            !copy_to_user(frame->rsi, &cursor, sizeof(cursor))) {
+            frame->rax = (uint64_t)-1;
+            return;
+        }
+
+        /* 1 = entry copied, 0 = end of directory, -1 = error. */
+        frame->rax = (uint64_t)result;
+        return;
+    }
+
+    case HISPERIA_SYS_EXIT: {
         /*
-         * In 64-bit mode IRETQ always consumes the complete five-qword
-         * return frame, including RSP and SS even when returning to CPL0.
-         * The syscall arrived on the dedicated TSS.RSP0 stack, so the
-         * address immediately after this frame is its original stack top.
-         * Do not leave the user RSP/SS (0x2B) in a Ring-0 return frame.
+         * IRETQ always consumes the complete five-qword return frame.
+         * Replace user RSP/SS with the suspended kernel stack before return.
          */
         uintptr_t kernel_resume_rsp =
             (uintptr_t)frame + sizeof(*frame);
@@ -182,10 +396,11 @@ void ring3_syscall_dispatch(struct ring3_syscall_frame *frame)
             return;
         }
 
+        user_files_close_all();
         exit_status = frame->rdi;
         frame->rip = (uint64_t)(uintptr_t)ring3_exit_trampoline;
         frame->cs = GDT_KERNEL_CODE_SELECTOR;
-        frame->rflags = 0x2ULL; /* IF=0, IOPL=0, reserved bit 1 set. */
+        frame->rflags = 0x2ULL;
         frame->rsp = (uint64_t)kernel_resume_rsp;
         frame->ss = GDT_KERNEL_DATA_SELECTOR;
         frame->rax = 0;
@@ -236,6 +451,7 @@ int ring3_run_self_test(void)
         return 0;
 
     current_space = (struct vmm_address_space){0};
+    user_files_close_all();
     exit_status = UINT64_MAX;
     exit_seen = 0;
     exit_cleanup_ok = 0;

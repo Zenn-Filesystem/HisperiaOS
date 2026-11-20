@@ -1,8 +1,9 @@
 # HisperiaOS ext4 + VFS (read-only v0.1)
 
-This change adds an ext4 read-only filesystem backend and a small path-based VFS API.
-It uses the existing `block_device` interface, so the same backend can read from
-AHCI SATA, legacy ATA PIO, or a RAM disk.
+This change adds an ext4 read-only filesystem backend behind a generic path-based
+VFS dispatcher. The VFS owns mount selection, operation dispatch, and open-file
+lifetime; ext4 provides the backend callbacks. It uses the existing `block_device`
+interface, so the same backend can read from AHCI SATA, legacy ATA PIO, or a RAM disk.
 
 ## VFS API
 
@@ -15,9 +16,10 @@ AHCI SATA, legacy ATA PIO, or a RAM disk.
   `cursor` to zero; returns `1` for an entry, `0` at end, `-1` on error.
 - `vfs_stat(path, &size, &type)` — obtain basic metadata.
 
-The first implementation intentionally mounts one ext4 volume as the VFS root.
-FAT32 remains available through its existing driver but is not yet registered as
-another VFS backend.
+The implementation intentionally mounts one filesystem as the VFS root. The
+`vfs_mount(operations, context)` interface is filesystem-agnostic; ext4 currently
+registers its callback table through `vfs_mount_ext4()`. FAT32 remains available
+through its existing driver but is not yet registered as another VFS backend.
 
 ## Supported ext4 profile
 
@@ -38,7 +40,7 @@ another VFS backend.
 - No legacy direct/indirect block mapping; files must use extents.
 - No symlink following, xattrs, encryption, inline data, compression, bigalloc,
   casefold, or directory indexing acceleration.
-- Only one mounted VFS root; no mount namespace or per-process file descriptors.
+- Only one mounted VFS root; no mount namespace. The current Ring 3 test harness has a single global 16-entry file-descriptor table, not per-process descriptor tables.
 - `vfs_readdir` uses a 32-bit byte-offset cursor in this initial version.
 
 ## Build and tests
@@ -47,12 +49,17 @@ another VFS backend.
 make clean
 make kernel
 make test-storage-host
+make test-vfs-host
 make test-ext4-host
 ```
 
-`test-ext4-host` builds a small synthetic ext4 image in memory and verifies
-mount, root directory enumeration, path lookup, and file read through VFS.
+`test-vfs-host` validates the filesystem-agnostic mount/dispatch layer using a
+mock backend. `test-ext4-host` builds a small synthetic ext4 image in memory and
+verifies mount, root directory enumeration, path lookup, and file read through VFS.
 
-The kernel boot path probes all AHCI-detected partitions and attempts to mount
-the first supported ext4 volume read-only. It then prints up to eight root
-entries. Runtime validation on QEMU and the physical laptop is still required.
+The kernel boot path probes AHCI first, then legacy ATA PIO if no ext4 root was
+mounted. Both transports feed the same `block_device` interface; partition
+scanning and ext4/VFS mounting do not depend on the controller. The first
+supported ext4 partition is mounted read-only as `/`, then up to eight root
+entries are printed. Runtime validation on QEMU and the physical laptop is
+still required.
